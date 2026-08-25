@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.log
+.opus-cache/
+dist/
+build/
+*.egg-info/
+.idea/
+.vscode/
+Thumbs.db

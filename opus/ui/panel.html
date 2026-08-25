@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Opus</title>
+  <link rel="stylesheet" href="/static/panel.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="titlebar">
+      <div class="brand">
+        <img class="orb" id="orb" src="/static/icon.png" alt="" title="Click if stuck on speaking" />
+        <div class="pywebview-drag-region brand-text">
+          <p class="name">Opus</p>
+          <p class="mode" id="mode">Starting…</p>
+        </div>
+      </div>
+      <div class="pywebview-drag-region titlebar-fill" aria-hidden="true"></div>
+      <button class="icon-btn" id="hide" title="Hide panel">–</button>
+    </header>
+
+    <p class="status" id="status">Say “Opus” or “Opus open your panel”.</p>
+    <button class="wake-btn" id="wakeBtn" style="display:none;">Wake Up</button>
+
+    <section class="card">
+      <h2>Voice</h2>
+      <label class="row toggle">
+        <span>Voice responses</span>
+        <input type="checkbox" id="voice_responses" />
+      </label>
+      <label class="stack">
+        <span>Voice</span>
+        <select id="tts_voice"></select>
+      </label>
+      <label class="stack">
+        <span>Volume <em id="volumeLabel">80</em></span>
+        <input type="range" id="volume" min="0" max="100" />
+      </label>
+      <label class="stack">
+        <span>Microphone input</span>
+        <select id="input_device"></select>
+      </label>
+      <label class="stack">
+        <span>Speaker output</span>
+        <select id="output_device"></select>
+      </label>
+      <label class="row toggle">
+        <span>Use cloned voice</span>
+        <input type="checkbox" id="use_cloned_voice" />
+      </label>
+      <p class="hint" id="cloneStatus">Send a 5–15 second clip to bake Ultron-style pitch/tone into the fast voice.</p>
+      <div class="actions">
+        <button type="button" id="btnCloneBrowse">Choose sound file</button>
+        <label class="file-btn">
+          Send file
+          <input type="file" id="clone_file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.wma" hidden />
+        </label>
+        <button type="button" class="ghost" id="btnClonePreview">Preview</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Capture</h2>
+      <p class="hint" id="captureStatus">Clips → D:\Clips\Opus\Clips · Recordings → D:\Clips\Opus\Recordings</p>
+      <label class="stack">
+        <span>Desktop audio track</span>
+        <select id="desktop_audio_device"></select>
+      </label>
+      <label class="stack">
+        <span>Game audio track (optional)</span>
+        <select id="game_audio_device"></select>
+      </label>
+      <label class="stack">
+        <span>Call audio track (optional)</span>
+        <select id="call_audio_device"></select>
+      </label>
+      <div class="actions">
+        <button type="button" id="btnRecord">Record</button>
+        <button type="button" id="btnStop">Stop</button>
+        <button type="button" id="btnClip">Clip last 30s</button>
+        <button type="button" id="btnShot">Screenshot</button>
+        <button type="button" class="ghost" id="btnFolder">Open folder</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Access</h2>
+      <label class="row toggle">
+        <span>Screen awareness</span>
+        <input type="checkbox" id="screen_awareness" />
+      </label>
+      <label class="row toggle">
+        <span>File access</span>
+        <input type="checkbox" id="file_access" />
+      </label>
+      <label class="row toggle">
+        <span>Background protection</span>
+        <input type="checkbox" id="background_protection" />
+      </label>
+      <p class="hint">Silently scans downloads, desktop files, and risky temp files with Windows Defender. Folders and zips you ask Opus to check are copied into a cyber box (Windows Sandbox) with no network and no access to this PC, extracted there, and scanned there.</p>
+    </section>
+
+    <section class="card">
+      <h2>Browser</h2>
+      <label class="stack">
+        <span>Default browser</span>
+        <select id="default_browser"></select>
+      </label>
+    </section>
+
+    <section class="card">
+      <h2>Location</h2>
+      <label class="stack">
+        <span>Home city (optional)</span>
+        <input type="text" id="location_city" placeholder="Leave blank to auto-detect" autocomplete="off" />
+      </label>
+      <p class="hint" id="locationHint">Opus uses Windows location or your network to guess weather near you.</p>
+    </section>
+
+    <section class="card">
+      <h2>Cloud</h2>
+      <label class="stack">
+        <span>API key</span>
+        <input type="password" id="openai_api_key" placeholder="sk-… already saved if set" autocomplete="off" />
+      </label>
+      <label class="stack">
+        <span>API base URL</span>
+        <input type="text" id="openai_base_url" />
+      </label>
+      <label class="stack">
+        <span>Model</span>
+        <input type="text" id="model" />
+      </label>
+      <p class="hint" id="keyHint"></p>
+    </section>
+
+    <section class="card">
+      <h2>Connected apps</h2>
+      <p class="hint">Opus talks to apps through their APIs, like Siri — not by clicking windows. Connect once, then say “play liked songs” from this PC or later from a phone.</p>
+      <label class="stack">
+        <span>Spotify Client ID</span>
+        <input type="text" id="spotify_client_id" placeholder="From developer.spotify.com" autocomplete="off" />
+      </label>
+      <p class="hint" id="spotifyRedirect"></p>
+      <p class="hint" id="spotifyHint">Create a Spotify app, add the redirect URI above, paste the Client ID, then connect.</p>
+      <div class="actions">
+        <button type="button" id="btnSpotifyConnect">Connect Spotify</button>
+        <button type="button" class="ghost" id="btnSpotifyDisconnect">Disconnect</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Discord Bot</h2>
+      <label class="row toggle">
+        <span>Enable Discord replies</span>
+        <input type="checkbox" id="discord_enabled" />
+      </label>
+      <label class="stack">
+        <span>Bot token</span>
+        <input type="password" id="discord_bot_token" placeholder="Discord bot token" autocomplete="off" />
+      </label>
+      <label class="stack">
+        <span>Trigger prefix</span>
+        <input type="text" id="discord_prefix" placeholder="opus" autocomplete="off" />
+      </label>
+      <label class="stack">
+        <span>Allowed guild IDs (optional)</span>
+        <input type="text" id="discord_allowed_guilds" placeholder="1234567890,9876543210" autocomplete="off" />
+      </label>
+      <label class="stack">
+        <span>Allowed channel IDs (optional)</span>
+        <input type="text" id="discord_allowed_channels" placeholder="1111111111,2222222222" autocomplete="off" />
+      </label>
+      <p class="hint" id="discordHint">When enabled, people can ask with “opus &lt;question&gt;” or by mentioning the bot.</p>
+    </section>
+
+    <section class="card log-card">
+      <h2>Conversation</h2>
+      <div class="log" id="log"></div>
+      <form id="askForm">
+        <input type="text" id="ask" placeholder="Type a command…" autocomplete="off" />
+        <button type="submit">Send</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>Download</h2>
+      <label class="stack">
+        <span>Video / Audio URL</span>
+        <input type="text" id="dl_url" placeholder="Paste a YouTube, Twitter, etc. URL" autocomplete="off" />
+      </label>
+      <label class="stack">
+        <span>Format</span>
+        <select id="dl_format">
+          <option value="video">Video (MP4)</option>
+          <option value="audio">Audio (MP3)</option>
+          <option value="music">Music (FLAC)</option>
+        </select>
+      </label>
+      <p class="hint" id="dlStatus"></p>
+      <div class="actions">
+        <button type="button" id="btnDownload">Download</button>
+        <button type="button" class="ghost" id="btnDlFolder">Open folder</button>
+      </div>
+    </section>
+  </div>
+  <script src="/static/panel.js"></script>
+</body>
+</html>

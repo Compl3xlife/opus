@@ -1,0 +1,204 @@
+:root {
+  --bg: #07090a;
+  --bg2: #0d1416;
+  --bg-glow-a: #12332a;
+  --bg-glow-b: #16253a;
+  --card: rgba(17, 24, 28, 0.88);
+  --line: rgba(119, 255, 170, 0.22);
+  --text: #e8f1ed;
+  --muted: #9fb6ab;
+  --copper: #7dffb1;
+  --copper-dim: #2f9b69;
+  --you: rgba(125, 255, 177, 0.12);
+  --opus: rgba(17, 24, 28, 0.92);
+  --danger: #ffb4b4;
+  --safe: env(safe-area-inset-bottom, 0px);
+  --safe-top: env(safe-area-inset-top, 0px);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(900px 380px at 95% -5%, var(--bg-glow-a) 0%, transparent 52%),
+    radial-gradient(700px 320px at -10% 0%, var(--bg-glow-b) 0%, transparent 58%),
+    linear-gradient(160deg, var(--bg), var(--bg2));
+  color: var(--text);
+  font: 16px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+body { padding: 0; }
+
+.app {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding: calc(12px + var(--safe-top)) 16px calc(16px + var(--safe));
+  max-width: 560px;
+  margin: 0 auto;
+  gap: 12px;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.brand { display: flex; gap: 10px; align-items: center; }
+.brand .name { margin: 0; font-weight: 650; letter-spacing: 0.02em; }
+.brand .mode { margin: 0; color: var(--muted); font-size: 13px; }
+
+.orb {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 6px rgba(125, 255, 177, 0.14);
+}
+
+.icon-btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text);
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  font-size: 18px;
+}
+
+.status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.chat {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 180px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.bubble {
+  max-width: 88%;
+  padding: 10px 12px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bubble.you {
+  align-self: flex-end;
+  background: var(--you);
+}
+
+.bubble.opus {
+  align-self: flex-start;
+  background: var(--opus);
+}
+
+.composer {
+  display: flex;
+  gap: 8px;
+}
+
+.composer input, .stack input, .stack select {
+  flex: 1;
+  width: 100%;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text);
+  border-radius: 14px;
+  padding: 12px 14px;
+  font: inherit;
+}
+
+.send, .talk, .sheet-card button {
+  appearance: none;
+  border: 0;
+  background: var(--copper);
+  color: #062016;
+  font-weight: 700;
+  border-radius: 14px;
+  padding: 12px 16px;
+  font: inherit;
+}
+
+.send { min-width: 48px; }
+
+.talk {
+  width: 100%;
+  min-height: 64px;
+  font-size: 18px;
+  box-shadow: 0 8px 24px rgba(125, 255, 177, 0.18);
+  user-select: none;
+  touch-action: none;
+}
+
+.talk.hot {
+  background: #ffb4b4;
+  color: #2a1010;
+}
+
+.sheet {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 20;
+}
+
+.sheet.hidden { display: none; }
+
+.sheet-card {
+  width: min(560px, 100%);
+  max-height: 88dvh;
+  overflow-y: auto;
+  background: #0d1416;
+  border: 1px solid var(--line);
+  border-radius: 20px 20px 0 0;
+  padding: 16px 16px calc(20px + var(--safe));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.sheet-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.sheet-head h2, h3 { margin: 0; }
+h3 { color: var(--copper); font-size: 15px; }
+
+.row.toggle {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.stack { display: flex; flex-direction: column; gap: 6px; }
+.stack span, .hint { color: var(--muted); font-size: 13px; }
+.hint.copy { word-break: break-all; color: var(--copper); }
+
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.ghost {
+  background: transparent !important;
+  color: var(--text) !important;
+  border: 1px solid var(--line) !important;
+}
+
+input[type="range"] { width: 100%; accent-color: var(--copper); }
+input[type="checkbox"] { width: 22px; height: 22px; accent-color: var(--copper); }

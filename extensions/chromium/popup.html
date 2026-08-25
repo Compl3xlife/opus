@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    body { font: 13px/1.4 Segoe UI, sans-serif; width: 260px; margin: 0; padding: 14px; background: #0c0d10; color: #ece7df; }
+    h1 { font-size: 12px; letter-spacing: .24em; text-transform: uppercase; color: #d4a574; margin: 0 0 8px; }
+    p { margin: 0 0 8px; color: #9a948a; }
+    #status { color: #ece7df; font-weight: 600; }
+    button { margin-top: 8px; background: #d4a574; color: #111; border: 0; padding: 8px 10px; cursor: pointer; width: 100%; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Opus Bridge</h1>
+  <p>Status: <span id="status">checking…</span></p>
+  <p id="detail">Keep Opus running in the tray. Reload this extension (0.5.1). Say “play showdown” or “play pokemon” — not Spotify. Bare “play” follows the open game tab and will not open osu unless that site is already open.</p>
+  <button id="reconnect">Reconnect now</button>
+  <script src="popup.js"></script>
+</body>
+</html>
