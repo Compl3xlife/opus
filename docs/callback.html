@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#07090a" />
+  <title>Opus + Spotify</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #07090a;
+      color: #e8f1ed;
+      font: 16px/1.45 Segoe UI, sans-serif;
+    }
+    .card {
+      padding: 28px 32px;
+      border: 1px solid rgba(119, 255, 170, 0.22);
+      border-radius: 16px;
+      max-width: 420px;
+    }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    p { margin: 0; color: #9fb6ab; }
+    .ok { color: #7dffb1; }
+    .bad { color: #ffb4b4; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="title">Connecting…</h1>
+    <p id="message">Finishing Spotify login.</p>
+  </div>
+  <script src="static/opus-client.js"></script>
+  <script>
+    (async () => {
+      const title = document.getElementById("title");
+      const message = document.getElementById("message");
+      const result = await window.OpusPhone.finishSpotifyLogin();
+      if (result.ok) {
+        title.className = "ok";
+        title.textContent = "Connected";
+        message.textContent = "Spotify is connected. Returning to Opus.";
+        setTimeout(() => { window.location.replace(window.OpusPhone.homeUrl()); }, 700);
+      } else {
+        title.className = "bad";
+        title.textContent = "Not connected";
+        message.textContent = result.error || "Spotify login failed.";
+        setTimeout(() => { window.location.replace(window.OpusPhone.homeUrl()); }, 2200);
+      }
+    })();
+  </script>
+</body>
+</html>
