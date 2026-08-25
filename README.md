@@ -69,17 +69,18 @@ Discord mode is chat-only (Q&A) and does not run local PC control actions.
 
 ## Phone version
 
-Opus on iPhone is a **home-screen web app**. It runs on the phone itself — this PC can be off. Chat, weather, Spotify, and hold-to-talk use the **phone’s internet**. Coin flip, dice, volume, and a few other commands still work offline. If a command needs the network and there isn’t one, Opus says: *Sorry I cannot find a good connection for that at the moment.*
+Opus on iPhone is a **home-screen web app**. It runs on the phone itself — this PC can be off. Chat, weather, Spotify, and talk use the **phone’s internet**. Coin flip, dice, volume, and a few other commands still work offline. If a command needs the network and there isn’t one, Opus says: *Sorry I cannot find a good connection for that at the moment.*
+
+iPhone will **not** let Opus listen in the background like Siri. Apple only allows Siri to stay awake for a wake word. Closest setup: a Shortcut named **Opus** that opens `https://compl3xlife.github.io/opus/?listen=1`, then **Add to Siri**. Say **Hey Siri, Opus** — the app opens and starts listening.
 
 Games, screenshots, and Windows control stay on the PC tray app (`.\run_opus.bat`).
 
 ### Install on iPhone (no PC required after this)
 
-1. Push this repo to GitHub. In the repo: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
-2. Run the **Phone PWA** workflow (it also runs on push). GitHub prints an `https://…` URL.
-3. On the iPhone, open that URL in **Safari** (not Chrome).
-4. Tap **Share → Add to Home Screen**.
-5. Open the Opus icon, paste an API key in settings. For Spotify, add the printed redirect URI in your Spotify Developer app, then Connect.
+1. On the iPhone, open **https://compl3xlife.github.io/opus/** in **Safari** (not Chrome).
+2. Tap **Share → Add to Home Screen**.
+3. Open the Opus icon, paste an API key in settings. For Spotify, add the printed redirect URI in your Spotify Developer app, then Connect.
+4. Optional: Shortcuts app → Open URL `https://compl3xlife.github.io/opus/?listen=1` → Add to Siri as **Opus**.
 
 The microphone needs HTTPS, which GitHub Pages provides.
 

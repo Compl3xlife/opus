@@ -6,11 +6,20 @@ const talk = $("talk");
 const textInput = $("text");
 const sheet = $("sheet");
 
+const SILENCE_MS = 600;
+const MAX_LISTEN_MS = 10000;
+const TAP_MS = 280;
+const SPEECH_RMS = 0.045;
+
 let settings = {};
 let recorder = null;
 let chunks = [];
 let holding = false;
 let speaking = false;
+let autoListen = false;
+let holdStarted = 0;
+let listenWatch = null;
+let listenStream = null;
 
 function speak(text) {
   if (!settings.voice_responses || !text || !window.speechSynthesis) return;
@@ -33,6 +42,10 @@ function addBubble(role, text) {
   chat.scrollTop = chat.scrollHeight;
 }
 
+function listenUrl() {
+  return new URL("?listen=1", window.location.href).href.split("#")[0];
+}
+
 function applySettings(data) {
   settings = data || {};
   $("voice_responses").checked = Boolean(settings.voice_responses);
@@ -48,6 +61,7 @@ function applySettings(data) {
   $("keyHint").textContent = settings.openai_api_key_set
     ? "API key is saved on this phone."
     : "Needed for talk and answers. Uses this phone's internet, not your PC.";
+  if ($("siriUrl")) $("siriUrl").textContent = listenUrl();
 }
 
 function loadSettings() {
@@ -82,7 +96,7 @@ async function ask(text) {
       addBubble("opus", reply);
       speak(reply);
     }
-    statusEl.textContent = "Hold the button and talk.";
+    statusEl.textContent = "Tap to talk, or say Hey Siri, Opus.";
     modeEl.textContent = "Phone";
   } catch (err) {
     const reply = window.OpusPhone.NO_CONNECTION;
@@ -100,46 +114,119 @@ async function transcribe(blob, ext = "webm") {
   return (data.text || "").trim();
 }
 
+function rmsLevel(bytes) {
+  let sum = 0;
+  for (let i = 0; i < bytes.length; i += 1) {
+    const v = (bytes[i] - 128) / 128;
+    sum += v * v;
+  }
+  return Math.sqrt(sum / Math.max(1, bytes.length));
+}
+
+function stopSilenceWatch() {
+  if (listenWatch) {
+    clearInterval(listenWatch);
+    listenWatch = null;
+  }
+}
+
+function watchSilence(stream) {
+  stopSilenceWatch();
+  if (!stream) {
+    listenWatch = setTimeout(() => endHold({ preventDefault() {} }, true), MAX_LISTEN_MS);
+    return;
+  }
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) {
+    listenWatch = setTimeout(() => endHold({ preventDefault() {} }, true), MAX_LISTEN_MS);
+    return;
+  }
+  const ctx = new AudioCtx();
+  const source = ctx.createMediaStreamSource(stream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  source.connect(analyser);
+  const data = new Uint8Array(analyser.fftSize);
+  const started = Date.now();
+  let heard = false;
+  let silentFor = 0;
+  listenWatch = setInterval(() => {
+    if (!holding) {
+      stopSilenceWatch();
+      ctx.close().catch(() => {});
+      return;
+    }
+    analyser.getByteTimeDomainData(data);
+    const rms = rmsLevel(data);
+    if (rms >= SPEECH_RMS) {
+      heard = true;
+      silentFor = 0;
+    } else if (heard) {
+      silentFor += 80;
+    }
+    if ((heard && silentFor >= SILENCE_MS) || Date.now() - started >= MAX_LISTEN_MS) {
+      ctx.close().catch(() => {});
+      endHold({ preventDefault() {} }, true);
+    }
+  }, 80);
+}
+
 async function startHold(event) {
-  event.preventDefault();
+  if (event) event.preventDefault();
   if (holding) return;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     statusEl.textContent = "This browser can't record audio.";
     return;
   }
   holding = true;
+  autoListen = false;
+  holdStarted = Date.now();
   talk.classList.add("hot");
   talk.textContent = "Listening…";
   chunks = [];
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    listenStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const types = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"];
     const mime = types.find((type) => MediaRecorder.isTypeSupported(type)) || "";
-    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    recorder = mime ? new MediaRecorder(listenStream, { mimeType: mime }) : new MediaRecorder(listenStream);
     recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
     recorder.start(200);
     if (window.speechSynthesis) window.speechSynthesis.cancel();
+    statusEl.textContent = "Listening…";
+    modeEl.textContent = "Listening";
   } catch (err) {
     holding = false;
     talk.classList.remove("hot");
-    talk.textContent = "Hold to talk";
-    statusEl.textContent = "Microphone permission is needed. Use HTTPS or Add to Home Screen.";
+    talk.textContent = "Tap to talk";
+    statusEl.textContent = "Microphone permission is needed. Open Opus from the home screen, then tap the button.";
   }
 }
 
-async function endHold(event) {
-  event.preventDefault();
+async function endHold(event, force = false) {
+  if (event) event.preventDefault();
   if (!holding) return;
+  const heldFor = Date.now() - holdStarted;
+  if (!force && heldFor < TAP_MS) {
+    autoListen = true;
+    watchSilence(listenStream);
+    statusEl.textContent = "Listening until you finish talking.";
+    return;
+  }
+  if (!force && autoListen) return;
   holding = false;
+  autoListen = false;
+  stopSilenceWatch();
   talk.classList.remove("hot");
-  talk.textContent = "Hold to talk";
+  talk.textContent = "Tap to talk";
   const rec = recorder;
   recorder = null;
+  const stream = listenStream;
+  listenStream = null;
   if (!rec) return;
   const ext = (rec.mimeType || "").includes("mp4") ? "m4a" : "webm";
   const blob = await new Promise((resolve) => {
     rec.onstop = () => {
-      rec.stream.getTracks().forEach((track) => track.stop());
+      if (stream) stream.getTracks().forEach((track) => track.stop());
       resolve(new Blob(chunks, { type: rec.mimeType || "audio/webm" }));
     };
     rec.stop();
@@ -163,6 +250,19 @@ async function endHold(event) {
       speak(reply);
     }
   }
+}
+
+function wantAutoListen() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("listen") === "1" || params.get("siri") === "1";
+}
+
+async function startFromSiri() {
+  statusEl.textContent = "Siri opened Opus. Starting the mic…";
+  await startHold(null);
+  if (!holding) return;
+  autoListen = true;
+  watchSilence(listenStream);
 }
 
 $("composer").addEventListener("submit", (event) => {
@@ -205,13 +305,29 @@ $("spotifyDisconnect").addEventListener("click", () => {
   statusEl.textContent = "Spotify disconnected.";
 });
 
+if ($("copySiriUrl")) {
+  $("copySiriUrl").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(listenUrl());
+      statusEl.textContent = "Siri URL copied. Paste it into a Shortcut, then Add to Siri.";
+    } catch {
+      statusEl.textContent = "Copy the URL shown in settings into a Shortcut.";
+    }
+  });
+}
+
 talk.addEventListener("pointerdown", startHold);
-window.addEventListener("pointerup", endHold);
-window.addEventListener("pointercancel", endHold);
+window.addEventListener("pointerup", (event) => endHold(event, false));
+window.addEventListener("pointercancel", (event) => endHold(event, true));
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
 
 loadSettings();
-statusEl.textContent = "Hold the button and talk. This app runs on your phone.";
+statusEl.textContent = "Tap to talk, or set up Hey Siri, Opus in settings.";
+if (wantAutoListen()) {
+  window.addEventListener("load", () => {
+    setTimeout(() => startFromSiri(), 250);
+  });
+}

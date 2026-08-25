@@ -33,7 +33,7 @@
       <button class="icon-btn" id="settingsBtn" type="button" aria-label="Settings">⚙</button>
     </header>
 
-    <p class="status" id="status">Hold the button and talk. This app runs on your phone.</p>
+    <p class="status" id="status">Tap to talk, or set up Hey Siri, Opus in settings.</p>
 
     <section class="chat" id="chat" aria-live="polite"></section>
 
@@ -42,7 +42,7 @@
       <button type="submit" class="send" aria-label="Send">➤</button>
     </form>
 
-    <button class="talk" id="talk" type="button">Hold to talk</button>
+    <button class="talk" id="talk" type="button">Tap to talk</button>
   </div>
 
   <div class="sheet hidden" id="sheet">
@@ -79,6 +79,13 @@
         <button type="button" class="ghost" id="spotifyDisconnect">Disconnect</button>
       </div>
       <p class="hint" id="spotifyAccount"></p>
+
+      <h3>Hey Siri</h3>
+      <p class="hint" id="siriHint">iPhone will not let Opus listen in the background like Siri. Closest setup: Shortcuts app → Open URL → Add to Siri as “Opus”. That opens this app and starts listening.</p>
+      <p class="hint copy" id="siriUrl"></p>
+      <div class="actions">
+        <button type="button" class="ghost" id="copySiriUrl">Copy Siri URL</button>
+      </div>
 
       <label class="stack">
         <span>Home city (optional)</span>
