@@ -1,4 +1,4 @@
-const CACHE = "opus-phone-v3";
+const CACHE = "opus-phone-v4";
 const PRECACHE = [
   "./",
   "./index.html",

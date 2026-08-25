@@ -20,6 +20,18 @@ let autoListen = false;
 let holdStarted = 0;
 let listenWatch = null;
 let listenStream = null;
+let wakeWanted = false;
+let wakeRunning = false;
+let wakeFollowupUntil = 0;
+let wakeBusy = false;
+
+function idleStatus() {
+  if (document.visibilityState !== "visible") {
+    return "Paused — iPhone stopped the mic in the background.";
+  }
+  if (settings.listen_while_open) return "Listening for Opus. Leave this screen open.";
+  return "Tap to talk, or set up Hey Siri, Opus in settings.";
+}
 
 function speak(text) {
   if (!settings.voice_responses || !text || !window.speechSynthesis) return;
@@ -49,6 +61,7 @@ function listenUrl() {
 function applySettings(data) {
   settings = data || {};
   $("voice_responses").checked = Boolean(settings.voice_responses);
+  if ($("listen_while_open")) $("listen_while_open").checked = settings.listen_while_open !== false;
   $("volume").value = String(settings.volume ?? 80);
   $("volumeLabel").textContent = String(settings.volume ?? 80);
   $("openai_api_key").placeholder = settings.openai_api_key_set ? "Key saved — paste to replace" : "Paste a key";
@@ -71,6 +84,7 @@ function loadSettings() {
 function saveSettings() {
   const patch = {
     voice_responses: $("voice_responses").checked,
+    listen_while_open: $("listen_while_open") ? $("listen_while_open").checked : true,
     volume: Number($("volume").value),
     spotify_client_id: $("spotify_client_id").value.trim(),
     location_city: $("location_city").value.trim(),
@@ -79,7 +93,8 @@ function saveSettings() {
   if (key) patch.openai_api_key = key;
   applySettings(window.OpusPhone.saveSettings(patch));
   $("openai_api_key").value = "";
-  statusEl.textContent = "Saved on this phone.";
+  startWakeFromToggle();
+  statusEl.textContent = settings.listen_while_open ? idleStatus() : "Saved on this phone.";
 }
 
 async function ask(text) {
@@ -96,8 +111,9 @@ async function ask(text) {
       addBubble("opus", reply);
       speak(reply);
     }
-    statusEl.textContent = "Tap to talk, or say Hey Siri, Opus.";
+    statusEl.textContent = idleStatus();
     modeEl.textContent = "Phone";
+    resumeWakeSoon();
   } catch (err) {
     const reply = window.OpusPhone.NO_CONNECTION;
     addBubble("opus", reply);
@@ -107,11 +123,184 @@ async function ask(text) {
   }
 }
 
-async function transcribe(blob, ext = "webm") {
-  statusEl.textContent = "Hearing you…";
+async function transcribe(blob, ext = "webm", quiet = false) {
+  if (!quiet) statusEl.textContent = "Hearing you…";
   const data = await window.OpusPhone.transcribe(blob, `utterance.${ext}`);
   if (data.error && !data.text) throw new Error(data.error);
   return (data.text || "").trim();
+}
+
+function stripWake(text) {
+  return String(text || "")
+    .replace(/^\s*(hey|ok|okay|hi)?\s*opus\s*[,.!?:]*/i, "")
+    .trim();
+}
+
+function heardWake(text) {
+  return /\bopus\b/i.test(text || "");
+}
+
+function mimeType() {
+  const types = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"];
+  return types.find((type) => MediaRecorder.isTypeSupported(type)) || "";
+}
+
+function blobExt(type) {
+  return (type || "").includes("mp4") ? "m4a" : "webm";
+}
+
+function recordUntilSilence(stream) {
+  return new Promise((resolve) => {
+    const mime = mimeType();
+    const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    const parts = [];
+    rec.ondataavailable = (e) => { if (e.data.size) parts.push(e.data); };
+    rec.onstop = () => resolve(new Blob(parts, { type: rec.mimeType || "audio/webm" }));
+    rec.start(200);
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+      setTimeout(() => rec.stop(), 2500);
+      return;
+    }
+    const ctx = new AudioCtx();
+    const source = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    source.connect(analyser);
+    const data = new Uint8Array(analyser.fftSize);
+    const started = Date.now();
+    let heard = false;
+    let silentFor = 0;
+    const tick = setInterval(() => {
+      analyser.getByteTimeDomainData(data);
+      const rms = rmsLevel(data);
+      if (rms >= SPEECH_RMS) {
+        heard = true;
+        silentFor = 0;
+      } else if (heard) {
+        silentFor += 80;
+      }
+      if ((heard && silentFor >= SILENCE_MS) || Date.now() - started >= MAX_LISTEN_MS) {
+        clearInterval(tick);
+        ctx.close().catch(() => {});
+        if (rec.state !== "inactive") rec.stop();
+      }
+    }, 80);
+  });
+}
+
+async function captureUtterance() {
+  if (!wakeStream || !wakeStream.active) {
+    wakeStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  }
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) return null;
+  const ctx = new AudioCtx();
+  const source = ctx.createMediaStreamSource(wakeStream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  source.connect(analyser);
+  const data = new Uint8Array(analyser.fftSize);
+  while (wakeWanted && document.visibilityState === "visible" && !holding && !speaking) {
+    analyser.getByteTimeDomainData(data);
+    if (rmsLevel(data) >= SPEECH_RMS) {
+      ctx.close().catch(() => {});
+      return recordUntilSilence(wakeStream);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  ctx.close().catch(() => {});
+  return null;
+}
+
+async function handleHeard(raw) {
+  const text = (raw || "").trim();
+  if (!text) return;
+  const rest = stripWake(text);
+  const followup = Date.now() < wakeFollowupUntil;
+  if (!rest && heardWake(text)) {
+    wakeFollowupUntil = Date.now() + 12000;
+    statusEl.textContent = "Go ahead.";
+    modeEl.textContent = "Listening";
+    return;
+  }
+  if (rest && heardWake(text)) {
+    wakeFollowupUntil = 0;
+    await ask(rest);
+    return;
+  }
+  if (followup) {
+    wakeFollowupUntil = 0;
+    await ask(text);
+  }
+}
+
+async function wakeLoop() {
+  if (wakeRunning) return;
+  wakeRunning = true;
+  try {
+    while (wakeWanted && document.visibilityState === "visible") {
+      if (holding || speaking || wakeBusy) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        continue;
+      }
+      let blob;
+      try {
+        blob = await captureUtterance();
+      } catch {
+        statusEl.textContent = "Tap once to allow the mic, then say Opus.";
+        break;
+      }
+      if (!blob || !blob.size || holding) continue;
+      if (document.visibilityState !== "visible") break;
+      wakeBusy = true;
+      try {
+        const heard = await transcribe(blob, blobExt(blob.type), true);
+        if (!holding) await handleHeard(heard);
+      } catch {
+        /* ignore a missed clip */
+      } finally {
+        wakeBusy = false;
+      }
+      if (wakeWanted && document.visibilityState === "visible" && !holding) {
+        statusEl.textContent = idleStatus();
+        modeEl.textContent = "Phone";
+      }
+    }
+  } finally {
+    wakeRunning = false;
+  }
+}
+
+function stopWakeMic() {
+  wakeWanted = false;
+  if (wakeStream) {
+    wakeStream.getTracks().forEach((track) => track.stop());
+    wakeStream = null;
+  }
+}
+
+function resumeWakeSoon() {
+  if (!settings.listen_while_open) return;
+  if (document.visibilityState !== "visible") return;
+  if (holding) return;
+  wakeWanted = true;
+  wakeLoop();
+}
+
+async function startWakeFromToggle() {
+  if (!settings.listen_while_open) {
+    stopWakeMic();
+    statusEl.textContent = idleStatus();
+    return;
+  }
+  try {
+    wakeStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    statusEl.textContent = idleStatus();
+    resumeWakeSoon();
+  } catch {
+    statusEl.textContent = "Tap once to allow the mic, then say Opus.";
+  }
 }
 
 function rmsLevel(bytes) {
@@ -185,7 +374,9 @@ async function startHold(event) {
   talk.textContent = "Listening…";
   chunks = [];
   try {
-    listenStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    listenStream = (wakeStream && wakeStream.active)
+      ? wakeStream
+      : await navigator.mediaDevices.getUserMedia({ audio: true });
     const types = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"];
     const mime = types.find((type) => MediaRecorder.isTypeSupported(type)) || "";
     recorder = mime ? new MediaRecorder(listenStream, { mimeType: mime }) : new MediaRecorder(listenStream);
@@ -226,19 +417,21 @@ async function endHold(event, force = false) {
   const ext = (rec.mimeType || "").includes("mp4") ? "m4a" : "webm";
   const blob = await new Promise((resolve) => {
     rec.onstop = () => {
-      if (stream) stream.getTracks().forEach((track) => track.stop());
+      if (stream && stream !== wakeStream) stream.getTracks().forEach((track) => track.stop());
       resolve(new Blob(chunks, { type: rec.mimeType || "audio/webm" }));
     };
     rec.stop();
   });
   if (!blob.size) {
-    statusEl.textContent = "I didn't catch that.";
+    statusEl.textContent = idleStatus();
+    resumeWakeSoon();
     return;
   }
   try {
     const heard = await transcribe(blob, ext);
     if (!heard) {
-      statusEl.textContent = "I didn't catch that.";
+      statusEl.textContent = idleStatus();
+      resumeWakeSoon();
       return;
     }
     await ask(heard);
@@ -249,6 +442,7 @@ async function endHold(event, force = false) {
       addBubble("opus", reply);
       speak(reply);
     }
+    resumeWakeSoon();
   }
 }
 
@@ -281,6 +475,20 @@ $("saveSettings").addEventListener("click", () => {
   } catch (err) {
     statusEl.textContent = err.message || "Save failed.";
   }
+});
+if ($("listen_while_open")) {
+  $("listen_while_open").addEventListener("change", () => saveSettings());
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") {
+    stopWakeMic();
+    statusEl.textContent = idleStatus();
+    modeEl.textContent = "Paused";
+    return;
+  }
+  applySettings(window.OpusPhone.loadSettings());
+  statusEl.textContent = idleStatus();
+  resumeWakeSoon();
 });
 $("volume").addEventListener("input", () => {
   $("volumeLabel").textContent = $("volume").value;
@@ -325,9 +533,11 @@ if ("serviceWorker" in navigator) {
 }
 
 loadSettings();
-statusEl.textContent = "Tap to talk, or set up Hey Siri, Opus in settings.";
+statusEl.textContent = idleStatus();
 if (wantAutoListen()) {
   window.addEventListener("load", () => {
     setTimeout(() => startFromSiri(), 250);
   });
+} else {
+  setTimeout(() => startWakeFromToggle(), 400);
 }

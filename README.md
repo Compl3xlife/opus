@@ -71,7 +71,7 @@ Discord mode is chat-only (Q&A) and does not run local PC control actions.
 
 Opus on iPhone is a **home-screen web app**. It runs on the phone itself — this PC can be off. Chat, weather, Spotify, and talk use the **phone’s internet**. Coin flip, dice, volume, and a few other commands still work offline. If a command needs the network and there isn’t one, Opus says: *Sorry I cannot find a good connection for that at the moment.*
 
-iPhone will **not** let Opus listen in the background like Siri. Apple only allows Siri to stay awake for a wake word. Closest setup: a Shortcut named **Opus** that opens `https://compl3xlife.github.io/opus/?listen=1`, then **Add to Siri**. Say **Hey Siri, Opus** — the app opens and starts listening.
+iPhone will **not** let Opus keep the microphone on in the background the way Spotify keeps playing music. Leave the Opus screen open and say **Opus**, then the command. If you switch apps, iPhone pauses the mic. For when the app is closed, use a Shortcut named **Opus** that opens `https://compl3xlife.github.io/opus/?listen=1`, then **Add to Siri**.
 
 Games, screenshots, and Windows control stay on the PC tray app (`.\run_opus.bat`).
 

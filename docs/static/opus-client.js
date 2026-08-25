@@ -124,6 +124,7 @@ When a tool succeeds, STOP. Say Done.`;
 
   const defaults = () => ({
     voice_responses: true,
+    listen_while_open: true,
     volume: 80,
     openai_api_key: "",
     openai_base_url: "",
