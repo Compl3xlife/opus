@@ -2,6 +2,8 @@
 
 Local Windows assistant that lives in the tray, listens for **“Opus”**, and answers using a cloud model. Say **“Opus open your panel”** for settings.
 
+The tray app uses a lime crown icon. A desktop shortcut (`Opus.lnk`) can point at `.venv\Scripts\pythonw.exe -m opus` with `opus.ico`.
+
 ## What it does now
 
 - Runs in the background (system tray)
@@ -13,13 +15,14 @@ Local Windows assistant that lives in the tray, listens for **“Opus”**, and 
 - Searches and opens files you ask for
 - Records to `D:\Clips\Opus\Recordings` and saves 30-second clips to `D:\Clips\Opus\Clips`. Xbox Game Bar (`Win+Alt+G` / `Win+Alt+R`) is used as a backup.
 - Scans new Downloads (and completed browser downloads) with **Windows Defender**
+- Optional Discord bot: chat, voice, music, polls, reaction roles, and a per-server chip economy
 
 Audio stays on the PC until you say “Opus”. After that, the clip is sent to your STT/LLM API so answers stay fast.
 
 ## Setup
 
 1. Run `setup.ps1` in PowerShell (creates a virtualenv and installs packages).
-2. Start Opus with `.\run_opus.bat`.
+2. Start Opus with `.\run_opus.bat`, or the desktop shortcut.
 3. Open the panel, paste an OpenAI-compatible API key (OpenAI, Groq, OpenRouter, etc.).
 4. Load the unpacked extension:
 
@@ -30,6 +33,8 @@ Audio stays on the PC until you say “Opus”. After that, the clip is sent to 
 | Firefox | `extensions\firefox` (`about:debugging` → This Firefox → Load Temporary Add-on) |
 
 Keep Opus running. The extension talks only to `127.0.0.1`.
+
+Tray-quit and start again after Python PC changes so the running process picks them up.
 
 ### Voice commands
 
@@ -48,24 +53,57 @@ Opus can read files and capture the screen **on this PC** when those options are
 
 Turn off screen awareness, file access, or download scanning in the panel if you want a smaller footprint.
 
-## Discord Bot (optional)
+## Discord bot (optional)
 
-Opus can also answer questions in a Discord server.
+Opus can chat, join server voice, play music, run polls, assign reaction roles, and keep a chip economy **per Discord server**. Chip balances, shop items, dailies, and poll bets are stored in `%AppData%\Roaming\Opus\discord_messages.db` and survive a PC restart. In-progress game stakes are refunded if Opus quits mid-hand.
+
+Discord does not run local Windows control (files, screen, recordings). Those stay on the tray app.
+
+### Connect the bot
 
 1. Create a Discord bot in the [Discord Developer Portal](https://discord.com/developers/applications).
-2. Enable **Message Content Intent** for the bot.
-3. Invite it to your server with message read/send permissions.
+2. Enable **Message Content Intent**, **Server Members Intent**, and **Voice States**.
+3. Invite it with message, voice, and embed permissions.
 4. Add these keys to `%AppData%\Roaming\Opus\settings.json`:
    - `"discord_enabled": true`
    - `"discord_bot_token": "YOUR_TOKEN"`
-   - Optional `"discord_prefix": "opus"` (default trigger prefix)
+   - Optional `"discord_prefix": "opus"`
    - Optional `"discord_allowed_guilds": "123,456"` and `"discord_allowed_channels": "789,012"` (comma-separated IDs)
 
-When enabled, anyone in allowed servers/channels can ask with:
-- `opus your question`
-- or by mentioning the bot.
+Ask with `opus your question`, a mention, or slash commands (`/opus`, `/join`, `/play`).
 
-Discord mode is chat-only (Q&A) and does not run local PC control actions.
+Discord cannot put a bot in private or group-DM voice. From a group DM, `opus join` hops into the author’s server voice channel instead.
+
+### Music and voice
+
+- `opus join` / `opus leave` — join or leave the call you are in
+- `opus play <song or YouTube link>` — queue and play in that call
+- Pause, skip, replay, and lyrics HUD from the music controls
+- `opus tts on` / `opus tts off` — speak replies in the call (music ducks under speech)
+
+### Chips and games
+
+New players start with **100** chips. Max bet is **100,000,000**. The house (Opus) starts with 100,000,000 and gets a **100,000,000 daily allowance** so large wins can pay.
+
+Vs-Opus games stay private (DM or a button only you can click), except roulette. Max **2** games at once. Luck items help vs Opus and steal — including the public roulette table — not player-vs-player pots. Items auto-use on the matching action.
+
+- `opus chips` · `opus stats` · `opus ranks` · `opus daily`
+- `opus shop` · `opus bag`
+- `opus ttt` — tic-tac-toe vs Opus (+25)
+- `opus ttt 50 @user` — they must accept (public)
+- `opus blackjack 25` · `opus slots 10` · `opus rps 10` · `opus dice 10 over`
+- `opus roulette` — public vs Opus; anyone can join the same spin
+- `opus coinflip 50 @user` — public; they accept and pick heads or tails
+- `opus pay 50 @user` · `opus bet 50 1` on a poll
+- `opus steal` — 0.001% from Opus · `opus steal @user` — 0.1% (30m cooldown)
+- `opus games` — command list
+
+Shop one-shots include Lucky Charm, Four-leaf Clover, Loaded Dice, Pocket Shield, House Cut, Coffee, Ace up your sleeve, Dealer's Peek, Mulligan, and Lucky Seven.
+
+### Polls and roles
+
+- `opus poll What should we play? | Valorant | Minecraft | League` — optional `for 6 hours` or `multiple`
+- `opus roles 🎮 @Gamer 🎨 @Artist` · `opus roles list` · `opus roles remove`
 
 ## Phone version
 
@@ -73,7 +111,7 @@ Opus on iPhone is a **home-screen web app**. It runs on the phone itself — thi
 
 iPhone will **not** let Opus keep the microphone on in the background the way Spotify keeps playing music. Leave the Opus screen open and say **Opus**, then the command. If you switch apps, iPhone pauses the mic. For when the app is closed, use a Shortcut named **Opus** that opens `https://compl3xlife.github.io/opus/?listen=1`, then **Add to Siri**.
 
-Games, screenshots, and Windows control stay on the PC tray app (`.\run_opus.bat`).
+Games, screenshots, and Windows control stay on the PC tray app (`.\run_opus.bat`). Discord chips stay on the PC Discord bot.
 
 ### Install on iPhone (no PC required after this)
 
