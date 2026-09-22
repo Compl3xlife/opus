@@ -33,6 +33,7 @@ SCOPES = " ".join(
         "user-read-email",
     )
 )
+READ_SCOPES = ("user-library-read", "playlist-read-private", "playlist-read-collaborative")
 CREATE_NO_WINDOW = 0x08000000
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -51,6 +52,17 @@ def redirect_uri(settings: Settings, *, public_host: str | None = None) -> str:
     return f"http://{host}:{port}/api/apps/spotify/callback"
 
 
+def _scope_set(settings: Settings) -> set[str]:
+    return {part for part in str(settings.get("spotify_scope") or "").split() if part}
+
+
+def _missing_scopes(settings: Settings, needed: tuple[str, ...] = READ_SCOPES) -> list[str]:
+    have = _scope_set(settings)
+    if not have:
+        return []
+    return [scope for scope in needed if scope not in have]
+
+
 def connection_status(settings: Settings, *, public_host: str | None = None) -> dict:
     connected = bool(settings.get("spotify_refresh_token"))
     return {
@@ -61,6 +73,7 @@ def connection_status(settings: Settings, *, public_host: str | None = None) -> 
         "client_id_set": bool((settings.get("spotify_client_id") or "").strip()),
         "redirect_uri": redirect_uri(settings, public_host=public_host),
         "needs_premium": True,
+        "needs_reconnect": bool(connected and _missing_scopes(settings)),
     }
 
 
@@ -93,6 +106,7 @@ def start_login(settings: Settings, *, open_browser: bool = True, public_host: s
         "state": state,
         "code_challenge_method": "S256",
         "code_challenge": challenge,
+        "show_dialog": "true",
     }
     url = f"{AUTH_URL}?{urlencode(params)}"
     if open_browser:
@@ -108,6 +122,8 @@ def disconnect(settings: Settings) -> dict:
             "spotify_token_expires_at": 0,
             "spotify_user_name": "",
             "spotify_user_id": "",
+            "spotify_scope": "",
+            "spotify_product": "",
         }
     )
     return connection_status(settings)
@@ -165,6 +181,7 @@ def finish_login(settings: Settings, *, code: str, state: str) -> dict:
             {
                 "spotify_user_name": me.get("display_name") or me.get("id") or "",
                 "spotify_user_id": me.get("id") or "",
+                "spotify_product": me.get("product") or "",
             }
         )
     except Exception:
@@ -180,6 +197,8 @@ def _store_tokens(settings: Settings, payload: dict, *, client_id: str = "") -> 
     }
     if payload.get("refresh_token"):
         patch["spotify_refresh_token"] = payload["refresh_token"]
+    if payload.get("scope") is not None:
+        patch["spotify_scope"] = str(payload.get("scope") or "")
     if client_id:
         patch["spotify_client_id"] = client_id
     settings.update(patch)
@@ -230,7 +249,45 @@ def connected(settings: Settings) -> bool:
     return bool((settings.get("spotify_refresh_token") or "").strip())
 
 
-def _api(settings: Settings, method: str, path: str, *, json: dict | None = None, params: dict | None = None) -> Any:
+def _error_fields(payload: Any) -> tuple[str, str]:
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("reason") or "").strip(), str(err.get("message") or "").strip()
+    return "", str(err or payload or "").strip()
+
+
+def _permission_from_403(settings: Settings, method: str, path: str, payload: Any) -> PermissionError:
+    reason, message = _error_fields(payload)
+    blob = f"{reason} {message}".lower()
+    log.warning("spotify 403 %s %s reason=%s message=%s", method, path, reason, message)
+    if method.upper() in {"GET", "HEAD"}:
+        if "scope" in blob:
+            return PermissionError(
+                "Spotify is missing playlist permission. Disconnect and connect Spotify again in my panel."
+            )
+        return PermissionError(
+            "Spotify wouldn't share that playlist. Disconnect and connect Spotify again in my panel, then try once more."
+        )
+    if "premium" in blob or reason.upper() == "PREMIUM_REQUIRED":
+        if str(settings.get("spotify_product") or "").lower() == "premium":
+            return PermissionError(
+                "Spotify refused playback on that device. Open the Spotify app on this PC, then try again."
+            )
+        return PermissionError("Spotify Premium is required for playback control.")
+    if "device" in blob or "restriction" in blob:
+        return PermissionError("Spotify isn't ready as a playback device yet. Open Spotify, then try again.")
+    return PermissionError("Spotify blocked playback. Open Spotify on this PC, then try once more.")
+
+
+def _api(
+    settings: Settings,
+    method: str,
+    path: str,
+    *,
+    json: dict | None = None,
+    params: dict | None = None,
+    forbidden_ok: bool = False,
+) -> Any:
     token = _token(settings)
     if not token:
         raise PermissionError("Spotify isn't connected.")
@@ -249,12 +306,10 @@ def _api(settings: Settings, method: str, path: str, *, json: dict | None = None
     except Exception:
         payload = {"error": response.text}
     if response.status_code == 403:
-        reason = ""
-        if isinstance(payload, dict):
-            reason = str((payload.get("error") or {}).get("reason") or payload.get("error") or "")
-        if "premium" in reason.lower():
-            raise PermissionError("Spotify Premium is required for playback control.")
-        raise PermissionError("Spotify blocked that. Premium is required, and Spotify needs a moment after it opens.")
+        if forbidden_ok:
+            log.warning("spotify 403 %s %s %s", method, path, payload)
+            return {"_forbidden": True, "_error": payload}
+        raise _permission_from_403(settings, method, path, payload)
     if response.status_code == 404:
         if method.upper() in {"PUT", "POST"}:
             raise RuntimeError("I opened Spotify, but it isn't ready as a playback device yet. Try once more.")
@@ -566,6 +621,210 @@ def now_playing(settings: Settings) -> str:
     except Exception:
         log.exception("spotify now playing failed")
         return "I couldn't see what's playing."
+
+
+def _spotify_user_id(settings: Settings) -> str:
+    uid = str(settings.get("spotify_user_id") or "").strip()
+    if uid:
+        return uid
+    try:
+        me = _api(settings, "GET", "/me") or {}
+    except Exception:
+        return ""
+    uid = str(me.get("id") or "").strip()
+    if uid:
+        settings.update({"spotify_user_id": uid, "spotify_product": me.get("product") or settings.get("spotify_product") or ""})
+    return uid
+
+
+def _paging_items(payload: dict) -> list:
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("items")
+    if isinstance(items, dict):
+        inner = items.get("items")
+        return inner if isinstance(inner, list) else []
+    if isinstance(items, list):
+        return items
+    tracks = payload.get("tracks")
+    if isinstance(tracks, dict):
+        inner = tracks.get("items")
+        if isinstance(inner, dict):
+            inner = inner.get("items")
+        return inner if isinstance(inner, list) else []
+    return []
+
+
+def _paging_total(payload: dict) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    for key in ("items", "tracks"):
+        block = payload.get(key)
+        if isinstance(block, dict) and block.get("total") is not None:
+            try:
+                return int(block.get("total") or 0)
+            except (TypeError, ValueError):
+                pass
+    try:
+        return int(payload.get("total") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _playlist_entry(item: dict) -> dict | None:
+    if not item or not item.get("id"):
+        return None
+    return {
+        "id": str(item.get("id") or ""),
+        "name": str(item.get("name") or "Playlist")[:100],
+        "tracks": _paging_total(item),
+    }
+
+
+def list_playlists(settings: Settings, *, limit: int = 50) -> list[dict]:
+    if not connected(settings):
+        raise PermissionError(_need_connect())
+    cap = max(1, min(50, int(limit)))
+    paths = ["/me/playlists"]
+    user_id = _spotify_user_id(settings)
+    if user_id:
+        paths.append(f"/users/{user_id}/playlists")
+    playlists: list[dict] = []
+    seen: set[str] = set()
+    for path in paths:
+        offset = 0
+        while len(playlists) < cap and offset < 200:
+            payload = _api(
+                settings,
+                "GET",
+                path,
+                params={
+                    "limit": "50",
+                    "offset": str(offset),
+                },
+                forbidden_ok=True,
+            ) or {}
+            if payload.get("_forbidden") or payload.get("_empty"):
+                break
+            items = payload.get("items") or []
+            for item in items:
+                entry = _playlist_entry(item) if isinstance(item, dict) else None
+                if not entry or entry["id"] in seen:
+                    continue
+                seen.add(entry["id"])
+                playlists.append(entry)
+                if len(playlists) >= cap:
+                    break
+            if not items or not payload.get("next"):
+                break
+            offset += max(len(items), 1)
+        if playlists:
+            break
+    return playlists
+
+
+def liked_track_total(settings: Settings) -> int:
+    if not connected(settings):
+        return 0
+    payload = _api(
+        settings,
+        "GET",
+        "/me/tracks",
+        params={"limit": "1", "market": "from_token"},
+        forbidden_ok=True,
+    ) or {}
+    if payload.get("_forbidden"):
+        return 0
+    return int(payload.get("total") or 0)
+
+
+def _media_from_row(row: dict | None) -> dict | None:
+    if not isinstance(row, dict):
+        return None
+    media = row.get("item") or row.get("track") or row.get("episode")
+    if not isinstance(media, dict):
+        if row.get("type") in {"track", "episode"} and row.get("name"):
+            media = row
+        else:
+            return None
+    if media.get("is_local") or row.get("is_local"):
+        return None
+    name = str(media.get("name") or "").strip()
+    if not name:
+        return None
+    episode = media.get("type") == "episode" or media.get("episode") is True
+    if episode and not media.get("artists"):
+        show = media.get("show") if isinstance(media.get("show"), dict) else {}
+        artists = str(show.get("name") or "")
+    else:
+        artists = ", ".join(
+            str(artist.get("name") or "")
+            for artist in (media.get("artists") or [])
+            if artist and artist.get("name")
+        )
+    return {
+        "name": name[:100],
+        "artists": artists[:100],
+        "query": f"{artists} - {name}" if artists else name,
+    }
+
+
+def _playlist_rows(settings: Settings, playlist_id: str, cap: int) -> list[dict]:
+    attempts = (
+        (f"/playlists/{playlist_id}/items", {"limit": str(min(50, cap))}),
+        (f"/playlists/{playlist_id}/items", {"limit": str(min(50, cap)), "additional_types": "track,episode"}),
+        (f"/playlists/{playlist_id}", {}),
+        (f"/playlists/{playlist_id}/tracks", {"limit": str(min(50, cap)), "additional_types": "track,episode"}),
+        (f"/playlists/{playlist_id}/tracks", {"limit": str(min(50, cap)), "market": "from_token"}),
+    )
+    for path, params in attempts:
+        payload = _api(settings, "GET", path, params=params, forbidden_ok=True) or {}
+        if payload.get("_forbidden") or payload.get("_empty"):
+            continue
+        rows = [row for row in _paging_items(payload) if isinstance(row, dict)]
+        if rows:
+            return rows
+        log.warning(
+            "spotify playlist empty path=%s total=%s keys=%s",
+            path,
+            _paging_total(payload),
+            list(payload.keys())[:12],
+        )
+    return []
+
+
+def playlist_track_details(settings: Settings, playlist_id: str, *, limit: int = 25) -> list[dict]:
+    if not connected(settings):
+        raise PermissionError(_need_connect())
+    cap = max(1, min(50, int(limit)))
+    playlist_id = (playlist_id or "").strip()
+    if playlist_id == "liked":
+        payload = _api(
+            settings,
+            "GET",
+            "/me/tracks",
+            params={"limit": str(cap), "market": "from_token"},
+        ) or {}
+        rows = _paging_items(payload)
+    else:
+        rows = _playlist_rows(settings, playlist_id, cap)
+    details: list[dict] = []
+    for row in rows:
+        parsed = _media_from_row(row if isinstance(row, dict) else None)
+        if not parsed:
+            continue
+        details.append(parsed)
+        if len(details) >= cap:
+            break
+    return details
+
+
+def playlist_track_queries(settings: Settings, playlist_id: str, *, limit: int = 25) -> list[str]:
+    return [
+        item["query"]
+        for item in playlist_track_details(settings, playlist_id, limit=limit)
+        if item.get("query")
+    ]
 
 
 def control(settings: Settings, action: str, query: str = "") -> str:

@@ -4,11 +4,17 @@ import json
 import re
 import sqlite3
 from datetime import datetime
-from threading import Lock
+from threading import RLock
 
 from opus.settings import appdata_dir
 
-_db_lock = Lock()
+_db_lock = RLock()
+CHIP_START = 100
+OPUS_BANK_ID = "opus"
+OPUS_BANK_START = 100_000_000
+OPUS_DAILY_ALLOWANCE = 100_000_000
+OPUS_DAILY_WAIT = 24 * 60 * 60
+MAX_BET = 100_000_000
 
 
 def _parse_ts(value: str) -> str:
@@ -47,8 +53,11 @@ class DiscordStore:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, check_same_thread=False)
+        conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
     def _init_db(self) -> None:
@@ -73,8 +82,905 @@ class DiscordStore:
                 CREATE INDEX IF NOT EXISTS idx_messages_author_name ON messages(author_name);
                 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
                 CREATE INDEX IF NOT EXISTS idx_messages_has_image ON messages(has_image);
+                CREATE TABLE IF NOT EXISTS reaction_roles (
+                    guild_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    emoji_key TEXT NOT NULL,
+                    emoji TEXT NOT NULL,
+                    role_id TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, message_id, emoji_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_reaction_roles_message
+                    ON reaction_roles(guild_id, message_id);
+                CREATE TABLE IF NOT EXISTS chip_wallets (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    user_name TEXT DEFAULT '',
+                    balance INTEGER NOT NULL DEFAULT 100,
+                    games_won INTEGER NOT NULL DEFAULT 0,
+                    games_played INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (guild_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS chip_polls (
+                    guild_id TEXT NOT NULL,
+                    poll_message_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    question TEXT,
+                    options TEXT NOT NULL,
+                    expires_at REAL NOT NULL,
+                    settled INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (guild_id, poll_message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chip_polls_due
+                    ON chip_polls(settled, expires_at);
+                CREATE TABLE IF NOT EXISTS chip_poll_bets (
+                    guild_id TEXT NOT NULL,
+                    poll_message_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    user_name TEXT DEFAULT '',
+                    option_idx INTEGER NOT NULL,
+                    amount INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, poll_message_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS chip_challenges (
+                    challenge_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    challenger_id TEXT NOT NULL,
+                    opponent_id TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    payload TEXT DEFAULT '{}',
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS chip_cooldowns (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    until_at REAL NOT NULL,
+                    PRIMARY KEY (guild_id, user_id, kind)
+                );
+                CREATE TABLE IF NOT EXISTS chip_inventory (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    qty INTEGER NOT NULL DEFAULT 0,
+                    expires_at REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY (guild_id, user_id, item_id)
+                );
+                CREATE TABLE IF NOT EXISTS chip_holds (
+                    hold_id TEXT PRIMARY KEY,
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    user_name TEXT DEFAULT '',
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    items TEXT NOT NULL DEFAULT '[]',
+                    created_at REAL NOT NULL
+                );
                 """
             )
+
+    def save_reaction_role(
+        self,
+        *,
+        guild_id: str,
+        channel_id: str,
+        message_id: str,
+        emoji_key: str,
+        emoji: str,
+        role_id: str,
+    ) -> None:
+        with _db_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO reaction_roles
+                    (guild_id, channel_id, message_id, emoji_key, emoji, role_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (str(guild_id), str(channel_id), str(message_id), str(emoji_key), str(emoji), str(role_id)),
+            )
+
+    def delete_reaction_message(self, guild_id: str, message_id: str) -> int:
+        with _db_lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM reaction_roles WHERE guild_id = ? AND message_id = ?",
+                (str(guild_id), str(message_id)),
+            )
+            return int(cur.rowcount or 0)
+
+    def lookup_reaction_role(self, guild_id: str, message_id: str, emoji_key: str) -> str:
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT role_id FROM reaction_roles
+                WHERE guild_id = ? AND message_id = ? AND emoji_key = ?
+                """,
+                (str(guild_id), str(message_id), str(emoji_key)),
+            ).fetchone()
+            return str(row["role_id"]) if row else ""
+
+    def list_reaction_roles(self, guild_id: str) -> list[dict]:
+        with _db_lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT channel_id, message_id, emoji, role_id
+                FROM reaction_roles
+                WHERE guild_id = ?
+                ORDER BY message_id, emoji
+                """,
+                (str(guild_id),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def _wallet_row(self, conn: sqlite3.Connection, guild_id: str, user_id: str, user_name: str = "") -> sqlite3.Row:
+        uid = str(user_id)
+        start = OPUS_BANK_START if uid == OPUS_BANK_ID else CHIP_START
+        label = "Opus" if uid == OPUS_BANK_ID else str(user_name or "")
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO chip_wallets (guild_id, user_id, user_name, balance)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(guild_id), uid, label, start),
+        )
+        if user_name:
+            conn.execute(
+                "UPDATE chip_wallets SET user_name = ? WHERE guild_id = ? AND user_id = ? AND (user_name IS NULL OR user_name = '')",
+                (str(user_name), str(guild_id), str(user_id)),
+            )
+            conn.execute(
+                "UPDATE chip_wallets SET user_name = ? WHERE guild_id = ? AND user_id = ?",
+                (str(user_name), str(guild_id), str(user_id)),
+            )
+        row = conn.execute(
+            "SELECT * FROM chip_wallets WHERE guild_id = ? AND user_id = ?",
+            (str(guild_id), str(user_id)),
+        ).fetchone()
+        return row
+
+    def wallet(self, guild_id: str, user_id: str, user_name: str = "") -> dict:
+        with _db_lock, self._connect() as conn:
+            return dict(self._wallet_row(conn, guild_id, user_id, user_name))
+
+    def try_spend(self, guild_id: str, user_id: str, amount: int, user_name: str = "") -> tuple[bool, int]:
+        amount = int(amount)
+        if amount <= 0:
+            return False, 0
+        with _db_lock, self._connect() as conn:
+            row = self._wallet_row(conn, guild_id, user_id, user_name)
+            balance = int(row["balance"] or 0)
+            if balance < amount:
+                return False, balance
+            conn.execute(
+                "UPDATE chip_wallets SET balance = balance - ? WHERE guild_id = ? AND user_id = ?",
+                (amount, str(guild_id), str(user_id)),
+            )
+            return True, balance - amount
+
+    def grant_opus_allowance(self, guild_id: str) -> int:
+        if self.cooldown_left(guild_id, OPUS_BANK_ID, "allowance") > 0:
+            return 0
+        self.set_cooldown(guild_id, OPUS_BANK_ID, "allowance", OPUS_DAILY_WAIT)
+        self.add_chips(guild_id, OPUS_BANK_ID, OPUS_DAILY_ALLOWANCE, user_name="Opus")
+        return OPUS_DAILY_ALLOWANCE
+
+    def pay_from_bank(self, guild_id: str, amount: int) -> bool:
+        self.grant_opus_allowance(guild_id)
+        amount = int(amount)
+        if amount <= 0:
+            return True
+        ok, balance = self.try_spend(guild_id, OPUS_BANK_ID, amount, user_name="Opus")
+        if ok:
+            return True
+        short = max(0, amount - int(balance or 0))
+        if short:
+            self.add_chips(guild_id, OPUS_BANK_ID, short, user_name="Opus")
+        ok, _left = self.try_spend(guild_id, OPUS_BANK_ID, amount, user_name="Opus")
+        return ok
+
+    def add_chips(
+        self,
+        guild_id: str,
+        user_id: str,
+        amount: int,
+        *,
+        user_name: str = "",
+        played: bool = False,
+        won: bool = False,
+    ) -> int:
+        with _db_lock, self._connect() as conn:
+            self._wallet_row(conn, guild_id, user_id, user_name)
+            conn.execute(
+                """
+                UPDATE chip_wallets
+                SET balance = balance + ?,
+                    games_played = games_played + ?,
+                    games_won = games_won + ?
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (int(amount), 1 if played else 0, 1 if won else 0, str(guild_id), str(user_id)),
+            )
+            row = conn.execute(
+                "SELECT balance FROM chip_wallets WHERE guild_id = ? AND user_id = ?",
+                (str(guild_id), str(user_id)),
+            ).fetchone()
+            return int(row["balance"] if row else 0)
+
+    def record_game(self, guild_id: str, user_id: str, *, won: bool, user_name: str = "") -> None:
+        self.add_chips(guild_id, user_id, 0, user_name=user_name, played=True, won=won)
+
+    def cooldown_left(self, guild_id: str, user_id: str, kind: str) -> float:
+        import time
+
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT until_at FROM chip_cooldowns
+                WHERE guild_id = ? AND user_id = ? AND kind = ?
+                """,
+                (str(guild_id), str(user_id), str(kind)),
+            ).fetchone()
+        if not row:
+            return 0.0
+        return max(0.0, float(row["until_at"]) - time.time())
+
+    def set_cooldown(self, guild_id: str, user_id: str, kind: str, seconds: float) -> None:
+        import time
+
+        with _db_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO chip_cooldowns (guild_id, user_id, kind, until_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (str(guild_id), str(user_id), str(kind), time.time() + max(0.0, float(seconds))),
+            )
+
+    def player_wallets(self, guild_id: str) -> list[dict]:
+        with _db_lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, user_name, balance, games_won, games_played
+                FROM chip_wallets
+                WHERE guild_id = ? AND user_id != ?
+                """,
+                (str(guild_id), OPUS_BANK_ID),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def leaderboard(self, guild_id: str, *, kind: str = "balance", limit: int = 10) -> list[dict]:
+        rows = [self._with_chip_stats(row) for row in self.player_wallets(guild_id)]
+        if kind == "wins":
+            rows.sort(key=lambda row: (int(row["games_won"]), int(row["balance"])), reverse=True)
+        elif kind == "losses":
+            rows.sort(key=lambda row: (int(row["losses"]), int(row["games_played"])), reverse=True)
+        elif kind == "ratio":
+            rows = [row for row in rows if int(row["games_played"]) >= 3]
+            rows.sort(
+                key=lambda row: (float(row["ratio"]), int(row["games_won"]), int(row["balance"])),
+                reverse=True,
+            )
+        else:
+            rows.sort(key=lambda row: (int(row["balance"]), int(row["games_won"])), reverse=True)
+        return rows[: max(1, int(limit))]
+
+    def chip_row(self, guild_id: str, user_id: str) -> dict | None:
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chip_wallets WHERE guild_id = ? AND user_id = ?",
+                (str(guild_id), str(user_id)),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def chip_profile(self, guild_id: str, user_id: str, user_name: str = "") -> dict:
+        raw = self.chip_row(guild_id, user_id) or {
+            "user_id": str(user_id),
+            "user_name": str(user_name or ""),
+            "balance": 0,
+            "games_won": 0,
+            "games_played": 0,
+        }
+        mine = self._with_chip_stats(raw)
+        players = [self._with_chip_stats(row) for row in self.player_wallets(guild_id)]
+        if not any(str(row["user_id"]) == str(user_id) for row in players):
+            players.append(mine)
+        total = len(players)
+
+        def rank_of(key: str, *, reverse: bool = True, played_min: int = 0) -> tuple[int | None, int]:
+            pool = [row for row in players if int(row["games_played"]) >= played_min]
+            ordered = sorted(
+                pool,
+                key=lambda row: (row[key], int(row["games_won"]), int(row["balance"])),
+                reverse=reverse,
+            )
+            for idx, row in enumerate(ordered, start=1):
+                if str(row["user_id"]) == str(user_id):
+                    return idx, len(pool)
+            return None, len(pool)
+
+        chips_rank, chips_of = rank_of("balance")
+        wins_rank, wins_of = rank_of("games_won")
+        losses_rank, losses_of = rank_of("losses")
+        ratio_rank, ratio_of = rank_of("ratio", played_min=3)
+        mine.update(
+            {
+                "chips_rank": chips_rank,
+                "chips_of": chips_of or total,
+                "wins_rank": wins_rank,
+                "wins_of": wins_of or total,
+                "losses_rank": losses_rank,
+                "losses_of": losses_of or total,
+                "ratio_rank": ratio_rank,
+                "ratio_of": ratio_of,
+            }
+        )
+        return mine
+
+    @staticmethod
+    def _with_chip_stats(row: dict) -> dict:
+        item = dict(row)
+        won = int(item.get("games_won") or 0)
+        played = int(item.get("games_played") or 0)
+        losses = max(0, played - won)
+        item["wins"] = won
+        item["losses"] = losses
+        item["played"] = played
+        item["ratio"] = (won / losses) if losses else (float("inf") if won else 0.0)
+        item["win_rate"] = (won / played) if played else 0.0
+        return item
+
+    def save_chip_poll(
+        self,
+        *,
+        guild_id: str,
+        poll_message_id: str,
+        channel_id: str,
+        question: str,
+        options: list[str],
+        expires_at: float,
+    ) -> None:
+        with _db_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO chip_polls
+                    (guild_id, poll_message_id, channel_id, question, options, expires_at, settled)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    str(guild_id),
+                    str(poll_message_id),
+                    str(channel_id),
+                    str(question or ""),
+                    json.dumps(list(options)),
+                    float(expires_at),
+                ),
+            )
+
+    def chip_poll(self, guild_id: str, poll_message_id: str) -> dict | None:
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chip_polls WHERE guild_id = ? AND poll_message_id = ?",
+                (str(guild_id), str(poll_message_id)),
+            ).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["options"] = json.loads(item.get("options") or "[]")
+            return item
+
+    def latest_chip_poll(self, guild_id: str, channel_id: str) -> dict | None:
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM chip_polls
+                WHERE guild_id = ? AND channel_id = ? AND settled = 0
+                ORDER BY expires_at DESC
+                LIMIT 1
+                """,
+                (str(guild_id), str(channel_id)),
+            ).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["options"] = json.loads(item.get("options") or "[]")
+            return item
+
+    def due_chip_polls(self, now: float) -> list[dict]:
+        with _db_lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM chip_polls
+                WHERE settled = 0 AND expires_at <= ?
+                ORDER BY expires_at ASC
+                LIMIT 20
+                """,
+                (float(now),),
+            ).fetchall()
+            out = []
+            for row in rows:
+                item = dict(row)
+                item["options"] = json.loads(item.get("options") or "[]")
+                out.append(item)
+            return out
+
+    def mark_poll_settled(self, guild_id: str, poll_message_id: str) -> None:
+        with _db_lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE chip_polls SET settled = 1 WHERE guild_id = ? AND poll_message_id = ?",
+                (str(guild_id), str(poll_message_id)),
+            )
+
+    def place_poll_bet(
+        self,
+        *,
+        guild_id: str,
+        poll_message_id: str,
+        user_id: str,
+        user_name: str,
+        option_idx: int,
+        amount: int,
+    ) -> tuple[str | None, int]:
+        amount = int(amount)
+        if amount <= 0:
+            return "Bet at least 1 chip.", 0
+        with _db_lock, self._connect() as conn:
+            poll = conn.execute(
+                "SELECT settled FROM chip_polls WHERE guild_id = ? AND poll_message_id = ?",
+                (str(guild_id), str(poll_message_id)),
+            ).fetchone()
+            if not poll:
+                return "There's no open poll to bet on.", 0
+            if int(poll["settled"] or 0):
+                return "That poll already paid out.", 0
+            existing = conn.execute(
+                """
+                SELECT amount FROM chip_poll_bets
+                WHERE guild_id = ? AND poll_message_id = ? AND user_id = ?
+                """,
+                (str(guild_id), str(poll_message_id), str(user_id)),
+            ).fetchone()
+            extra = amount
+            if existing:
+                extra = amount - int(existing["amount"] or 0)
+            wallet = self._wallet_row(conn, guild_id, user_id, user_name)
+            balance = int(wallet["balance"] or 0)
+            if extra > 0 and balance < extra:
+                return f"You only have {balance} chips.", balance
+            if extra:
+                conn.execute(
+                    "UPDATE chip_wallets SET balance = balance - ? WHERE guild_id = ? AND user_id = ?",
+                    (extra, str(guild_id), str(user_id)),
+                )
+            elif extra < 0:
+                conn.execute(
+                    "UPDATE chip_wallets SET balance = balance + ? WHERE guild_id = ? AND user_id = ?",
+                    (-extra, str(guild_id), str(user_id)),
+                )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO chip_poll_bets
+                    (guild_id, poll_message_id, user_id, user_name, option_idx, amount)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (str(guild_id), str(poll_message_id), str(user_id), str(user_name or ""), int(option_idx), amount),
+            )
+            row = conn.execute(
+                "SELECT balance FROM chip_wallets WHERE guild_id = ? AND user_id = ?",
+                (str(guild_id), str(user_id)),
+            ).fetchone()
+            return None, int(row["balance"] if row else 0)
+
+    def poll_bets(self, guild_id: str, poll_message_id: str) -> list[dict]:
+        with _db_lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, user_name, option_idx, amount
+                FROM chip_poll_bets
+                WHERE guild_id = ? AND poll_message_id = ?
+                """,
+                (str(guild_id), str(poll_message_id)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def refund_poll_bets(self, guild_id: str, poll_message_id: str) -> list[dict]:
+        bets = self.poll_bets(guild_id, poll_message_id)
+        with _db_lock, self._connect() as conn:
+            for bet in bets:
+                self._wallet_row(conn, guild_id, bet["user_id"], bet.get("user_name") or "")
+                conn.execute(
+                    "UPDATE chip_wallets SET balance = balance + ? WHERE guild_id = ? AND user_id = ?",
+                    (int(bet["amount"]), str(guild_id), str(bet["user_id"])),
+                )
+            conn.execute(
+                "DELETE FROM chip_poll_bets WHERE guild_id = ? AND poll_message_id = ?",
+                (str(guild_id), str(poll_message_id)),
+            )
+        return bets
+
+    def create_challenge(
+        self,
+        *,
+        guild_id: str,
+        channel_id: str,
+        kind: str,
+        challenger_id: str,
+        opponent_id: str,
+        amount: int,
+        payload: dict | None = None,
+    ) -> int:
+        import time
+
+        with _db_lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO chip_challenges
+                    (guild_id, channel_id, kind, status, challenger_id, opponent_id, amount, payload, created_at)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(guild_id),
+                    str(channel_id),
+                    str(kind),
+                    str(challenger_id),
+                    str(opponent_id),
+                    int(amount),
+                    json.dumps(payload or {}),
+                    time.time(),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def challenge(self, challenge_id: int) -> dict | None:
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chip_challenges WHERE challenge_id = ?",
+                (int(challenge_id),),
+            ).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            item["payload"] = json.loads(item.get("payload") or "{}")
+            return item
+
+    def set_challenge(self, challenge_id: int, *, status: str | None = None, payload: dict | None = None) -> None:
+        with _db_lock, self._connect() as conn:
+            if status is not None:
+                conn.execute(
+                    "UPDATE chip_challenges SET status = ? WHERE challenge_id = ?",
+                    (str(status), int(challenge_id)),
+                )
+            if payload is not None:
+                conn.execute(
+                    "UPDATE chip_challenges SET payload = ? WHERE challenge_id = ?",
+                    (json.dumps(payload), int(challenge_id)),
+                )
+
+    def update_challenge_status(self, challenge_id: int, *, from_status: str, to_status: str) -> dict | None:
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chip_challenges WHERE challenge_id = ? AND status = ?",
+                (int(challenge_id), str(from_status)),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                "UPDATE chip_challenges SET status = ? WHERE challenge_id = ?",
+                (str(to_status), int(challenge_id)),
+            )
+            item = dict(row)
+            item["payload"] = json.loads(item.get("payload") or "{}")
+            item["status"] = to_status
+            return item
+
+    def open_challenge_count(self, guild_id: str, user_id: str) -> int:
+        import time
+
+        cutoff = time.time() - 12 * 60
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM chip_challenges
+                WHERE guild_id = ? AND status IN ('pending', 'picking', 'active')
+                  AND created_at >= ?
+                  AND (challenger_id = ? OR opponent_id = ?)
+                """,
+                (str(guild_id), cutoff, str(user_id), str(user_id)),
+            ).fetchone()
+            return int(row["n"] if row else 0)
+
+    def _expire_challenge_row(self, challenge_id: int, from_status: str, *, refund: str) -> dict | None:
+        item = self.update_challenge_status(challenge_id, from_status=from_status, to_status="expired")
+        if not item:
+            return None
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        amount = int(item.get("amount") or 0)
+        if amount <= 0:
+            return item
+        if refund == "hold" and payload.get("hold", True):
+            self.add_chips(item["guild_id"], item["challenger_id"], amount)
+        elif refund == "both":
+            self.add_chips(item["guild_id"], item["challenger_id"], amount)
+            self.add_chips(item["guild_id"], item["opponent_id"], amount)
+        return item
+
+    def expire_challenges(self, older_than: float) -> list[dict]:
+        import time
+
+        now = time.time()
+        expired = []
+        with _db_lock, self._connect() as conn:
+            pending = conn.execute(
+                """
+                SELECT challenge_id FROM chip_challenges
+                WHERE status = 'pending' AND created_at <= ?
+                """,
+                (float(older_than),),
+            ).fetchall()
+            picking = conn.execute(
+                """
+                SELECT challenge_id FROM chip_challenges
+                WHERE status = 'picking' AND created_at <= ?
+                """,
+                (now - 120,),
+            ).fetchall()
+            active = conn.execute(
+                """
+                SELECT challenge_id FROM chip_challenges
+                WHERE status = 'active' AND created_at <= ?
+                """,
+                (now - 12 * 60,),
+            ).fetchall()
+        for row in pending:
+            item = self._expire_challenge_row(int(row["challenge_id"]), "pending", refund="hold")
+            if item:
+                expired.append(item)
+        for row in picking:
+            item = self._expire_challenge_row(int(row["challenge_id"]), "picking", refund="both")
+            if item:
+                expired.append(item)
+        for row in active:
+            item = self._expire_challenge_row(int(row["challenge_id"]), "active", refund="none")
+            if item:
+                expired.append(item)
+        return expired
+
+    def inventory(self, guild_id: str, user_id: str) -> list[dict]:
+        with _db_lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT item_id, qty, expires_at FROM chip_inventory
+                WHERE guild_id = ? AND user_id = ? AND qty > 0
+                ORDER BY item_id
+                """,
+                (str(guild_id), str(user_id)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def item_qty(self, guild_id: str, user_id: str, item_id: str, *, now: float | None = None) -> int:
+        import time
+
+        stamp = time.time() if now is None else float(now)
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT qty, expires_at FROM chip_inventory
+                WHERE guild_id = ? AND user_id = ? AND item_id = ?
+                """,
+                (str(guild_id), str(user_id), str(item_id)),
+            ).fetchone()
+            if not row or int(row["qty"] or 0) <= 0:
+                return 0
+            expires = float(row["expires_at"] or 0)
+            if expires and expires < stamp:
+                return 0
+            return int(row["qty"] or 0)
+
+    def add_item(
+        self,
+        guild_id: str,
+        user_id: str,
+        item_id: str,
+        *,
+        qty: int = 1,
+        expires_at: float = 0.0,
+    ) -> int:
+        with _db_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO chip_inventory (guild_id, user_id, item_id, qty, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id, item_id) DO UPDATE SET
+                    qty = chip_inventory.qty + excluded.qty,
+                    expires_at = CASE
+                        WHEN excluded.expires_at > chip_inventory.expires_at THEN excluded.expires_at
+                        ELSE chip_inventory.expires_at
+                    END
+                """,
+                (str(guild_id), str(user_id), str(item_id), max(1, int(qty)), float(expires_at or 0)),
+            )
+            row = conn.execute(
+                "SELECT qty FROM chip_inventory WHERE guild_id = ? AND user_id = ? AND item_id = ?",
+                (str(guild_id), str(user_id), str(item_id)),
+            ).fetchone()
+            return int(row["qty"] if row else 0)
+
+    def consume_item(self, guild_id: str, user_id: str, item_id: str, *, qty: int = 1) -> bool:
+        import time
+
+        need = max(1, int(qty))
+        stamp = time.time()
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT qty, expires_at FROM chip_inventory
+                WHERE guild_id = ? AND user_id = ? AND item_id = ?
+                """,
+                (str(guild_id), str(user_id), str(item_id)),
+            ).fetchone()
+            if not row:
+                return False
+            expires = float(row["expires_at"] or 0)
+            have = int(row["qty"] or 0)
+            if have < need:
+                return False
+            if expires and expires < stamp:
+                conn.execute(
+                    "DELETE FROM chip_inventory WHERE guild_id = ? AND user_id = ? AND item_id = ?",
+                    (str(guild_id), str(user_id), str(item_id)),
+                )
+                return False
+            left = have - need
+            if left <= 0:
+                conn.execute(
+                    "DELETE FROM chip_inventory WHERE guild_id = ? AND user_id = ? AND item_id = ?",
+                    (str(guild_id), str(user_id), str(item_id)),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE chip_inventory SET qty = ? WHERE guild_id = ? AND user_id = ? AND item_id = ?
+                    """,
+                    (left, str(guild_id), str(user_id), str(item_id)),
+                )
+            return True
+
+    def _add_item_conn(
+        self,
+        conn: sqlite3.Connection,
+        guild_id: str,
+        user_id: str,
+        item_id: str,
+        *,
+        qty: int = 1,
+        expires_at: float = 0.0,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO chip_inventory (guild_id, user_id, item_id, qty, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id, item_id) DO UPDATE SET
+                qty = chip_inventory.qty + excluded.qty,
+                expires_at = CASE
+                    WHEN excluded.expires_at > chip_inventory.expires_at THEN excluded.expires_at
+                    ELSE chip_inventory.expires_at
+                END
+            """,
+            (str(guild_id), str(user_id), str(item_id), max(1, int(qty)), float(expires_at or 0)),
+        )
+
+    def _refund_hold_row(self, conn: sqlite3.Connection, row) -> None:
+        gid = str(row["guild_id"])
+        uid = str(row["user_id"])
+        name = str(row["user_name"] or "")
+        amount = int(row["amount"] or 0)
+        if amount > 0:
+            self._wallet_row(conn, gid, uid, name)
+            conn.execute(
+                "UPDATE chip_wallets SET balance = balance + ? WHERE guild_id = ? AND user_id = ?",
+                (amount, gid, uid),
+            )
+        try:
+            items = json.loads(row["items"] or "[]")
+        except Exception:
+            items = []
+        if not isinstance(items, list):
+            items = []
+        for item_id in items:
+            key = str(item_id or "").strip()
+            if key:
+                self._add_item_conn(conn, gid, uid, key)
+
+    def place_hold(
+        self,
+        guild_id: str,
+        user_id: str,
+        amount: int,
+        *,
+        hold_id: str,
+        items: list[str] | None = None,
+        user_name: str = "",
+    ) -> None:
+        import time
+
+        token = str(hold_id or "").strip()
+        if not token:
+            return
+        payload = [str(item) for item in (items or []) if str(item).strip()]
+        with _db_lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO chip_holds
+                    (hold_id, guild_id, user_id, user_name, amount, items, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    str(guild_id),
+                    str(user_id),
+                    str(user_name or ""),
+                    max(0, int(amount)),
+                    json.dumps(payload),
+                    time.time(),
+                ),
+            )
+
+    def release_hold(self, hold_id: str | None, *, refund: bool = False) -> dict | None:
+        token = str(hold_id or "").strip()
+        if not token:
+            return None
+        with _db_lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM chip_holds WHERE hold_id = ?",
+                (token,),
+            ).fetchone()
+            if not row:
+                return None
+            item = dict(row)
+            if refund:
+                self._refund_hold_row(conn, row)
+            conn.execute("DELETE FROM chip_holds WHERE hold_id = ?", (token,))
+            return item
+
+    def restore_open_holds(self) -> int:
+        with _db_lock, self._connect() as conn:
+            rows = conn.execute("SELECT * FROM chip_holds").fetchall()
+            restored = 0
+            for row in rows:
+                self._refund_hold_row(conn, row)
+                conn.execute("DELETE FROM chip_holds WHERE hold_id = ?", (str(row["hold_id"]),))
+                restored += 1
+            return restored
+
+    def close_challenge(self, challenge_id: int, *, refund: str | None = None) -> dict | None:
+        item = self.challenge(challenge_id)
+        if not item:
+            return None
+        status = str(item.get("status") or "")
+        if status not in {"pending", "picking", "active"}:
+            return None
+        if refund is None:
+            refund = "hold" if status == "pending" else "both"
+        return self._expire_challenge_row(int(challenge_id), status, refund=refund)
+
+    def abandon_live_challenges(self) -> int:
+        with _db_lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT challenge_id FROM chip_challenges
+                WHERE status IN ('pending', 'picking', 'active')
+                """
+            ).fetchall()
+        closed = 0
+        for row in rows:
+            if self.close_challenge(int(row["challenge_id"])):
+                closed += 1
+        return closed
+
+    def checkpoint(self) -> None:
+        with _db_lock, self._connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def upsert_message(
         self,

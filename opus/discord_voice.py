@@ -48,9 +48,11 @@ class CallSink:
         self._lock = threading.Lock()
         self.ignore_until = 0.0
         self.packets = 0
+        self.raw_packets = 0
         self.bytes_seen = 0
 
     def write(self, user, data) -> None:
+        self.raw_packets += 1
         if time.time() < self.ignore_until:
             return
         if user is not None and getattr(user, "bot", False):

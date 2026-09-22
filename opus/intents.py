@@ -33,15 +33,14 @@ SPOTIFY_PLAY_RE = re.compile(
     re.IGNORECASE,
 )
 SLEEP_RE = re.compile(
-    r"\b("
+    r"^(?:please\s+)?("
     r"stop listening|"
     r"go to sleep|"
     r"good ?night|"
     r"that'?s all|"
-    r"never ?mind|"
-    r"(go\s+)?(to\s+)?sleep(\s+now)?|"
-    r"\bnap\b"
-    r")\b",
+    r"(?:go\s+to\s+)?sleep(?:\s+now)?|"
+    r"nap"
+    r")[.!?]*$",
     re.IGNORECASE,
 )
 SHUTDOWN_RE = re.compile(r"\b(shut\s*down|turn\s*off|power\s*off|shut\s*off)\b", re.IGNORECASE)
@@ -60,6 +59,15 @@ DISCORD_SELF_RE = re.compile(r"\bself[\s-]*(mute|unmute|deafen|undeafen|disconne
 DISCORD_LEAVE_RE = re.compile(r"\b(leave|hang\s*up|disconnect)\s+(the\s+)?(call|vc|voice|channel)\b", re.IGNORECASE)
 DISCORD_JOIN_RE = re.compile(
     r"\b(join|enter|hop\s+in(?:to)?|come\s+(?:in|to|into))\s+(the\s+)?(call|vc|voice(\s+channel)?)\b",
+    re.IGNORECASE,
+)
+DISCORD_INVITE_RE = re.compile(
+    r"("
+    r"^(invite(\s+(link|url|me))?)$"
+    r"|\b(invite|add)\s+(opus|the\s+bot|you)\b"
+    r"|\binvite(\s+(link|url))\b"
+    r"|\bjoin(\s+(another|other)\s+servers?)\b"
+    r")",
     re.IGNORECASE,
 )
 DISCORD_BOT_LEAVE_RE = re.compile(
@@ -229,7 +237,10 @@ FILL_LOGIN_RE = re.compile(
     r"\b(log me in(?:to)?|log into|login to|sign me in(?:to)?|type (?:my )?password|fill (?:the )?login)\b",
     re.IGNORECASE,
 )
-DISMISS_RE = re.compile(r"\b(thank you|thanks|thank ya|appreciate it)\b", re.IGNORECASE)
+DISMISS_RE = re.compile(
+    r"^(?:please\s+)?(thank you|thanks|thank ya|appreciate it)[.!?]*$",
+    re.IGNORECASE,
+)
 WEATHER_RE = re.compile(
     r"\b(weather|temperature|forecast|how hot|how cold|will it rain|going to rain|rain today)\b",
     re.IGNORECASE,
@@ -328,6 +339,7 @@ PARALLEL_INTENTS = frozenset(
         "discord_leave_call",
         "discord_join_call",
         "discord_bot_leave",
+        "discord_invite",
         "discord_search",
         "coinflip",
         "dice",
@@ -552,6 +564,8 @@ def _match_single_intent(text: str, *, allow_ask: bool = True) -> Intent | None:
     if self_intent and not is_phone():
         return self_intent
     if not is_phone():
+        if DISCORD_INVITE_RE.search(command):
+            return Intent("discord_invite")
         if DISCORD_JOIN_RE.search(command):
             return Intent("discord_join_call")
         if DISCORD_BOT_LEAVE_RE.search(command):

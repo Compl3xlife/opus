@@ -61,8 +61,19 @@ async function loadSettings() {
   const discordHint = $("discordHint");
   if (discordHint) {
     discordHint.textContent = data.discord_bot_token_set
-      ? "Discord token is saved. Use 'opus <question>' or mention the bot."
+      ? "Discord token is saved. Use 'opus <question>' or mention the bot. Say 'opus invite' for a server invite link."
       : "Paste your Discord bot token, then turn on Enable Discord replies.";
+  }
+  const invite = data.discord_invite_url || "";
+  const inviteWrap = $("discordInviteWrap");
+  const inviteHint = $("discordInviteHint");
+  const inviteBtn = $("btnDiscordInvite");
+  if (inviteWrap) inviteWrap.hidden = !invite;
+  if (inviteHint) inviteHint.hidden = !invite;
+  if (inviteBtn) {
+    inviteBtn.onclick = () => {
+      if (invite) window.open(invite, "_blank", "noopener");
+    };
   }
   loadBrowserOptions(data.default_browser);
   await loadDevices(
@@ -87,9 +98,15 @@ function applySpotifyStatus(data) {
   }
   if (!hint) return;
   if (data.spotify_connected) {
-    hint.textContent = data.spotify_account
-      ? `Connected as ${data.spotify_account}. Premium is required for playback.`
-      : "Spotify is connected. Premium is required for playback.";
+    if (data.spotify_needs_reconnect) {
+      hint.textContent = data.spotify_account
+        ? `Connected as ${data.spotify_account}, but playlist access needs a reconnect. Disconnect, then Connect Spotify again.`
+        : "Spotify is connected, but playlist access needs a reconnect. Disconnect, then Connect Spotify again.";
+    } else {
+      hint.textContent = data.spotify_account
+        ? `Connected as ${data.spotify_account}. Premium is required for playback.`
+        : "Spotify is connected. Premium is required for playback.";
+    }
   } else {
     hint.textContent = "Create a Spotify app at developer.spotify.com, add the redirect URI, paste the Client ID, then connect.";
   }

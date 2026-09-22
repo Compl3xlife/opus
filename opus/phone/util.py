@@ -22,22 +22,47 @@ def ensure_phone_icons() -> Path:
 
 
 def lan_addresses() -> list[str]:
-    hosts: list[str] = []
+    return [ip for _kind, ip in nic_ipv4s()]
+
+
+def nic_ipv4s() -> list[tuple[str, str]]:
+    """Return (kind, ipv4) for this PC. kind is usb, wifi, or lan."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        import psutil
+
+        for name, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if getattr(addr, "family", None) != socket.AF_INET:
+                    continue
+                ip = addr.address or ""
+                if not ip or ip.startswith("127.") or ip in seen:
+                    continue
+                seen.add(ip)
+                found.append((_nic_kind(name, ip), ip))
+    except Exception:
+        pass
+    if found:
+        return found
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("8.8.8.8", 80))
-            hosts.append(sock.getsockname()[0])
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                found.append((_nic_kind("", ip), ip))
     except OSError:
         pass
-    try:
-        hostname = socket.gethostname()
-        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
-            addr = info[4][0]
-            if addr not in hosts and not addr.startswith("127."):
-                hosts.append(addr)
-    except OSError:
-        pass
-    return hosts
+    return found
+
+
+def _nic_kind(name: str, ip: str) -> str:
+    lowered = f"{name} {ip}".lower()
+    if ip.startswith("172.20.10.") or "apple" in lowered or "iphone" in lowered or "mobile" in lowered:
+        return "usb"
+    if "wi-fi" in lowered or "wifi" in lowered or "wlan" in lowered:
+        return "wifi"
+    return "lan"
 
 
 def public_host_from_request(request) -> str:

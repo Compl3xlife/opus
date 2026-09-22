@@ -105,7 +105,7 @@ class WakeListener:
     def is_followup(self) -> bool:
         return time.time() < self._followup_until
 
-    def arm_followup(self, seconds: float = 15.0) -> None:
+    def arm_followup(self, seconds: float = 25.0) -> None:
         self._followup_until = time.time() + seconds
         hub.set_status(mode="followup", message="I'm listening.")
 
@@ -198,7 +198,7 @@ class WakeListener:
             text = self._transcribe(self._preprocess(self._trim(audio)))
             log.info("wake probe: %r", text)
             if contains_wake(text):
-                self.arm_followup(15)
+                self.arm_followup(25)
         except Exception:
             log.exception("wake probe failed")
 
@@ -333,7 +333,7 @@ class WakeListener:
                 if contains_wake(text):
                     log.info("waking from sleep on: %r", text)
                     self.set_enabled(True)
-                    self.arm_followup(15)
+                    self.arm_followup(25)
                     # Defer handling so we don't nest tray/TTS work inside STT drain.
                     uttered = text
                     threading.Thread(

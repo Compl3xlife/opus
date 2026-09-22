@@ -7,7 +7,7 @@ from opus.logutil import get_logger
 from opus.net_policy import configure_policy
 from opus.phone.controller import PhoneController
 from opus.phone.server import create_app
-from opus.phone.util import ensure_phone_icons, lan_addresses
+from opus.phone.util import ensure_phone_icons, lan_addresses, nic_ipv4s
 from opus.settings import Settings
 
 log = get_logger()
@@ -24,19 +24,23 @@ def main() -> None:
     port = int(settings.get("port") or 5841)
     hub.set_status(listening=True, speaking=False, mode="idle", message="Open this page on your phone.")
 
-    addrs = lan_addresses()
+    addrs = nic_ipv4s()
     print()
     print("Opus phone page is being served for local preview.")
     print(f"  Local:  http://127.0.0.1:{port}")
-    for addr in addrs:
-        print(f"  Preview: http://{addr}:{port}")
+    for kind, ip in addrs:
+        label = {"usb": "USB phone", "wifi": "Wi-Fi", "lan": "LAN"}.get(kind, kind)
+        print(f"  {label}: http://{ip}:{port}")
     if not addrs:
-        print("  Preview: use this PC's LAN IP on port", port)
-    print("  The iPhone home-screen app does not need this PC after GitHub Pages is published.")
-    print("  Settings on the published app are stored on the phone.")
+        print("  Preview: use this PC's LAN or USB IP on port", port)
+    if any(kind == "usb" for kind, _ip in addrs):
+        print("  Plug in this iPhone, tap Trust, turn on Personal Hotspot, then open the USB phone URL in Safari.")
+    else:
+        print("  For a private cable link: plug in the iPhone, Trust this PC, turn on Personal Hotspot, then restart this.")
+    print("  The iPhone home-screen app at https://compl3xlife.github.io/opus/ does not need this PC.")
     print("  Ctrl+C to stop.")
     print()
-    log.info("phone listening on %s:%s lan=%s", host, port, addrs)
+    log.info("phone listening on %s:%s lan=%s", host, port, lan_addresses())
 
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)

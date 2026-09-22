@@ -77,6 +77,13 @@ def create_app(settings: Settings, controller) -> FastAPI:
             data["discord_bot_token"] = ""
         else:
             data["discord_bot_token_set"] = False
+        data["discord_invite_url"] = ""
+        if data.get("discord_bot_token_set"):
+            from opus.discord_bot import discord_invite_url
+
+            data["discord_invite_url"] = discord_invite_url(
+                token=settings.get("discord_bot_token") or ""
+            )
         data["spotify_client_secret"] = ""
         data["spotify_access_token"] = ""
         data["spotify_refresh_token"] = ""
@@ -87,6 +94,7 @@ def create_app(settings: Settings, controller) -> FastAPI:
         data["spotify_connected"] = bool(spotify.get("connected"))
         data["spotify_account"] = spotify.get("account") or ""
         data["spotify_redirect_uri"] = spotify.get("redirect_uri") or ""
+        data["spotify_needs_reconnect"] = bool(spotify.get("needs_reconnect"))
         return data
 
     @app.put("/api/settings")
@@ -106,6 +114,13 @@ def create_app(settings: Settings, controller) -> FastAPI:
         updated["openai_api_key_set"] = bool(settings.get("openai_api_key"))
         updated["discord_bot_token"] = ""
         updated["discord_bot_token_set"] = bool(settings.get("discord_bot_token"))
+        updated["discord_invite_url"] = ""
+        if updated["discord_bot_token_set"]:
+            from opus.discord_bot import discord_invite_url
+
+            updated["discord_invite_url"] = discord_invite_url(
+                token=settings.get("discord_bot_token") or ""
+            )
         updated["spotify_client_secret"] = ""
         updated["spotify_access_token"] = ""
         updated["spotify_refresh_token"] = ""
@@ -115,6 +130,7 @@ def create_app(settings: Settings, controller) -> FastAPI:
         updated["spotify_connected"] = bool(spotify.get("connected"))
         updated["spotify_account"] = spotify.get("account") or ""
         updated["spotify_redirect_uri"] = spotify.get("redirect_uri") or ""
+        updated["spotify_needs_reconnect"] = bool(spotify.get("needs_reconnect"))
         return updated
 
     @app.get("/api/apps")
@@ -246,7 +262,7 @@ p {{ margin:0; color:#9fb6ab; }}
     @app.post("/api/listen")
     def force_listen():
         hub.set_status(speaking=False, mode="followup", message="I'm listening.")
-        controller.listener.arm_followup(15)
+        controller.listener.arm_followup(25)
         return {"ok": True}
 
     @app.post("/api/wake")

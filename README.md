@@ -88,4 +88,12 @@ The microphone needs HTTPS, which GitHub Pages provides.
 
 `.\run_opus_phone.bat` still serves the same page at `http://YOUR-PC-IP:5841` for local testing. The iPhone does not need this after the Pages URL is installed.
 
+To use a **USB cable instead of Wi-Fi** (just this phone and this PC):
+
+1. Plug the iPhone into this PC and tap **Trust**.
+2. On the iPhone, turn on **Personal Hotspot** (USB is enough; Wi-Fi hotspot can stay off).
+3. Run `.\run_opus_phone.bat` and open the printed **USB phone** address in Safari.
+
+USB hotspot is mainly so the PC can use the phone’s internet. Some iPhones still cannot open the PC’s page over the cable. If Safari fails, use https://compl3xlife.github.io/opus/ instead. The microphone also needs HTTPS, so hold-to-talk may fail on the `http://` USB address.
+
 Settings for the standalone app are stored **on the phone**, not in `%AppData%\Roaming\OpusPhone`.

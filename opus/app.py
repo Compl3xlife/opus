@@ -92,7 +92,7 @@ class OpusApp:
         except Exception:
             pass
         hub.set_status(speaking=False, mode="followup", message="I'm listening.")
-        self.listener.arm_followup(15)
+        self.listener.arm_followup(25)
 
     def listening_enabled(self) -> bool:
         return bool(self.listener._enabled)
@@ -166,8 +166,7 @@ class OpusApp:
                     self.speaker.stop()
                 except Exception:
                     pass
-            self.listener.disarm_followup()
-            self._reply("You're welcome.", arm_followup=False)
+            self._reply("You're welcome.", arm_followup=True)
             return
 
         if (
@@ -206,7 +205,7 @@ class OpusApp:
         if summary:
             self._reply(summary, keep_listening=keep_listening, arm_followup=arm_followup)
         elif keep_listening and arm_followup:
-            self.listener.arm_followup(15)
+            self.listener.arm_followup(25)
 
         if do_shutdown:
             self.shutdown()
@@ -278,7 +277,7 @@ class OpusApp:
             if not self.listener._enabled:
                 self.listener.set_enabled(True)
                 self.tray.set_active(True)
-            self.listener.arm_followup(15)
+            self.listener.arm_followup(25)
             hub.set_status(listening=True, mode="followup", message="I'm listening.")
             return IntentResult(reply=None, arm_followup=True)
         if intent.name == "discord_mod":
@@ -311,6 +310,10 @@ class OpusApp:
         if intent.name == "discord_join_call":
             if hasattr(self, "discord") and self.discord:
                 return IntentResult(reply=self.discord.run_join_call())
+            return IntentResult(reply="Discord bot isn't running")
+        if intent.name == "discord_invite":
+            if hasattr(self, "discord") and self.discord:
+                return IntentResult(reply=self.discord.invite_reply())
             return IntentResult(reply="Discord bot isn't running")
         if intent.name == "discord_bot_leave":
             if hasattr(self, "discord") and self.discord:
@@ -576,7 +579,7 @@ class OpusApp:
             hub.set_status(speaking=False)
             if keep_listening:
                 if arm_followup:
-                    self.listener.arm_followup(15)
+                    self.listener.arm_followup(25)
                 else:
                     self.listener.disarm_followup()
                 self.listener.mute_for(0.12)
@@ -709,6 +712,15 @@ class OpusApp:
         phases = match_intent_phases(raw)
         flat = [intent for phase in phases for intent in phase]
         extra = {intent.name for intent in flat} - {"ask", "await_command"}
+        # Call follow-up is everyone in the VC. Don't let overheard "sleep"/"thanks"
+        # pause the PC mic unless they actually said Opus.
+        if not contains_wake(text):
+            extra -= {"sleep", "shutdown", "restart", "dismiss"}
+            phases = [
+                [intent for intent in phase if intent.name not in {"sleep", "shutdown", "restart", "dismiss"}]
+                for phase in phases
+            ]
+            flat = [intent for phase in phases for intent in phase]
         self._from_call = True
         self._call_guild_id = guild_id or ""
         self._call_reply_text = ""

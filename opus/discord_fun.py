@@ -40,7 +40,7 @@ def fun_reply(text: str) -> str | None:
     raw = re.sub(r"^\s*opus[,:]?\s*", "", (text or "").strip(), flags=re.IGNORECASE).strip()
     if not raw:
         return None
-    if COINFLIP_RE.search(raw):
+    if COINFLIP_RE.search(raw) and not re.search(r"\d", raw):
         return coinflip()
     if DICE_RE.search(raw):
         return roll_dice(raw)

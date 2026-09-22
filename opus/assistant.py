@@ -644,6 +644,7 @@ class Assistant:
         self.on_restart = on_restart
         self._token = 0
         self._pool = ApiPool(settings)
+        self._skip_models: set[str] = set()
 
     def cancel(self) -> None:
         self._token += 1
@@ -717,11 +718,35 @@ class Assistant:
                     if item:
                         bullets.append(item[:180])
                 return sanitize_achievement_bullets(bullets, snippets)
-            except Exception:
+            except Exception as exc:
                 log.exception("achievement compile failed model=%s", model)
+                if self._is_missing_model(exc):
+                    self._mark_model_unavailable(model)
                 continue
         return []
 
+
+    def _is_missing_model(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "model_not_found" in text or "does not exist" in text or "do not have access" in text
+
+    def _mark_model_unavailable(self, model: str) -> None:
+        name = (model or "").strip()
+        if not name:
+            return
+        if name not in self._skip_models:
+            log.warning("groq model unavailable, skipping %s", name)
+        self._skip_models.add(name)
+
+    def _note_working_model(self, model: str) -> None:
+        name = (model or "").strip()
+        if not name:
+            return
+        current = (self.settings.get("model") or "").strip()
+        if current == name:
+            return
+        if current in self._skip_models or current in RETIRED_GROQ:
+            self.settings.update({"model": name})
 
     def _has_keys(self) -> bool:
         return self._pool.has_keys()
@@ -772,10 +797,10 @@ class Assistant:
         if not self._is_groq():
             return [configured] if configured else ["gpt-4o-mini"]
         models: list[str] = []
-        if configured and configured not in RETIRED_GROQ:
+        if configured and configured not in RETIRED_GROQ and configured not in self._skip_models:
             models.append(configured)
         for name in GROQ_CHAT_MODELS:
-            if name not in models:
+            if name not in models and name not in RETIRED_GROQ and name not in self._skip_models:
                 models.append(name)
         return models
 
@@ -784,10 +809,10 @@ class Assistant:
         if not self._is_groq():
             return [configured] if configured else ["gpt-4o"]
         models: list[str] = []
-        if configured and configured not in RETIRED_GROQ:
+        if configured and configured not in RETIRED_GROQ and configured not in self._skip_models:
             models.append(configured)
         for name in GROQ_VISION_MODELS:
-            if name not in models:
+            if name not in models and name not in RETIRED_GROQ and name not in self._skip_models:
                 models.append(name)
         return models
 
@@ -834,7 +859,8 @@ class Assistant:
                     last_error = exc
                     log.exception("chat failed model=%s tools=%s", model, use_tools)
                     err = str(exc).lower()
-                    if "model_not_found" in err or "does not exist" in err:
+                    if self._is_missing_model(exc) or "model_not_found" in err or "does not exist" in err:
+                        self._mark_model_unavailable(model)
                         break
                     if is_rate_limit(exc):
                         break
@@ -951,8 +977,7 @@ class Assistant:
                     continue
                 if token != self._token:
                     return ""
-                if model != self.settings.get("model"):
-                    self.settings.update({"model": model})
+                self._note_working_model(model)
                 return _strip_model_thinking((choice.content or "").strip()) or "Done."
         return friendly_error(last_error) if last_error else "No Groq model was available."
 
@@ -1017,14 +1042,20 @@ class Assistant:
                         content = re.sub(r"^\s*[-*•]\s+", "", content, flags=re.MULTILINE)
                         content = ROBOTIC_MEMBER_REPLY_RE.sub("", content).strip()
                         if content and not _is_robotic_member_reply(content):
+                            self._note_working_model(model)
                             return content
                         continue
+                    self._note_working_model(model)
                     return content
             except Exception as exc:
                 last_error = exc
                 log.exception("discord conversation failed model=%s", model)
-                if "model_not_found" in str(exc).lower():
-                    break
+                if self._is_missing_model(exc):
+                    self._mark_model_unavailable(model)
+                    continue
+                if is_rate_limit(exc):
+                    continue
+                break
         return friendly_error(last_error) if last_error else (
             _known_member_reply(member_query, user_text) or "Hey."
         )
@@ -1151,11 +1182,13 @@ class Assistant:
                 )
                 content = _strip_model_thinking(getattr(response.choices[0].message, "content", "") or "")
                 if content:
+                    self._note_working_model(model)
                     return content
             except Exception as exc:
                 last_error = exc
                 log.exception("discord factual failed model=%s", model)
-                if "model_not_found" in str(exc).lower():
+                if self._is_missing_model(exc):
+                    self._mark_model_unavailable(model)
                     continue
                 if is_rate_limit(exc):
                     continue
@@ -1180,7 +1213,11 @@ class Assistant:
         if use_tools:
             kwargs["tools"] = tools or TOOL_SCHEMAS
             kwargs["tool_choice"] = "auto"
-        if hide_reasoning and self._is_groq_url(base_url or self.settings.get("openai_base_url") or ""):
+        if (
+            hide_reasoning
+            and "gpt-oss" in (model or "")
+            and self._is_groq_url(base_url or self.settings.get("openai_base_url") or "")
+        ):
             kwargs["extra_body"] = {
                 "reasoning_format": "hidden",
                 "reasoning_effort": "low",
@@ -1252,6 +1289,9 @@ class Assistant:
             except Exception as exc:
                 last_error = exc
                 log.exception("vision failed model=%s", vision_model)
+                if self._is_missing_model(exc):
+                    self._mark_model_unavailable(vision_model)
+                    continue
                 if is_rate_limit(exc):
                     continue
         window = foreground_window()

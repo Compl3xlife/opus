@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import re
 import threading
+import urllib.error
+import urllib.request
 from difflib import SequenceMatcher
 
 import discord
+from discord import app_commands
 
 from opus.discord_guild import CREATOR_DISCORD_ID, GuildScopedOps
 from opus.discord_music import MusicManager
@@ -16,7 +21,17 @@ from opus.logutil import get_logger
 log = get_logger()
 
 JOIN_CALL_RE = re.compile(
-    r"^(join|come)(\s+(the\s+)?(call|vc|voice|channel))?$",
+    r"^(please\s+)?(join|come(\s+(here|in|on))?|hop\s+in)"
+    r"(\s+(the\s+|this\s+|our\s+)?(call|vc|voice|channel))?\s*[.!?]*$",
+    re.IGNORECASE,
+)
+INVITE_RE = re.compile(
+    r"^(please\s+)?("
+    r"invite(\s+(link|url|me))?"
+    r"|invite\s+(to\s+)?((a|the|another|other)\s+)?servers?"
+    r"|add(\s+me|\s+you|\s+the\s+bot)?(\s+to)?(\s+(a|the|another|other)\s+)?servers?"
+    r"|join(\s+(another|other|a|the)\s+)?servers?"
+    r")\s*[.!?]*$",
     re.IGNORECASE,
 )
 LEAVE_CALL_RE = re.compile(
@@ -67,6 +82,168 @@ SCAN_COMMAND_RE = re.compile(
 )
 
 
+class InteractionMessage:
+    """Duck-typed message so slash commands reuse the prefix command path."""
+
+    def __init__(self, interaction: discord.Interaction, content: str) -> None:
+        self.author = interaction.user
+        self.guild = interaction.guild
+        self.channel = interaction.channel
+        self.content = content
+        self.reference = None
+        self.attachments: list = []
+        self.embeds: list = []
+        self.role_mentions: list = []
+        self.mentions: list = []
+        self.id = int(getattr(interaction, "id", 0) or 0)
+        self._interaction = interaction
+
+    async def reply(self, content=None, **kwargs):
+        text = content if content is not None else kwargs.pop("content", "")
+        kwargs.pop("mention_author", None)
+        await self._interaction.followup.send(str(text)[:1800], **kwargs)
+
+
+def bot_user_id_from_token(token: str) -> str:
+    raw = (token or "").strip()
+    if not raw:
+        return ""
+    try:
+        part = raw.split(".")[0]
+        pad = "=" * ((4 - len(part) % 4) % 4)
+        decoded = base64.b64decode(part + pad).decode("ascii")
+        if decoded.isdigit():
+            return decoded
+    except Exception:
+        pass
+    return ""
+
+
+def _invite_permissions() -> discord.Permissions:
+    return discord.Permissions(
+        view_channel=True,
+        send_messages=True,
+        embed_links=True,
+        attach_files=True,
+        read_message_history=True,
+        add_reactions=True,
+        connect=True,
+        speak=True,
+        mute_members=True,
+        deafen_members=True,
+        move_members=True,
+        use_voice_activation=True,
+        moderate_members=True,
+        manage_roles=True,
+        send_polls=True,
+    )
+
+
+def _invite_permission_value() -> str:
+    return str(_invite_permissions().value)
+
+
+def discord_invite_url(*, token: str = "", client_id: str | int | None = None) -> str:
+    cid = str(client_id or "").strip() or bot_user_id_from_token(token)
+    if not cid:
+        return ""
+    try:
+        url = discord.utils.oauth_url(
+            int(cid),
+            permissions=_invite_permissions(),
+            scopes=("bot", "applications.commands"),
+        )
+        if "integration_type=" not in url:
+            url += "&integration_type=0"
+        return url
+    except Exception:
+        log.exception("discord invite url failed")
+        return ""
+
+
+def _discord_app_request(method: str, token: str, payload: dict | None = None) -> dict | None:
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://discord.com/api/v10/applications/@me",
+        data=body,
+        method=method,
+        headers={
+            "Authorization": f"Bot {token}",
+            "User-Agent": "Opus",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8")[:400]
+        except Exception:
+            pass
+        log.warning("discord application %s failed status=%s body=%s", method, exc.code, detail)
+        return None
+    except Exception:
+        log.exception("discord application %s failed", method)
+        return None
+
+
+def ensure_discord_guild_install(token: str) -> bool:
+    """Make Discord's Add to Server actually add the bot user, not only slash commands."""
+    raw = (token or "").strip()
+    if not raw:
+        return False
+    app = _discord_app_request("GET", raw)
+    if not app:
+        return False
+    perms = _invite_permission_value()
+    guild_params = ((app.get("integration_types_config") or {}).get("0") or {}).get(
+        "oauth2_install_params"
+    ) or {}
+    default_params = app.get("install_params") or {}
+    guild_scopes = [str(s) for s in (guild_params.get("scopes") or [])]
+    default_scopes = [str(s) for s in (default_params.get("scopes") or [])]
+    user_cfg = (app.get("integration_types_config") or {}).get("1") or {}
+    user_scopes = [
+        str(s) for s in (user_cfg.get("oauth2_install_params") or {}).get("scopes") or []
+    ]
+    if (
+        "bot" in guild_scopes
+        and "bot" in default_scopes
+        and "applications.commands" in user_scopes
+    ):
+        return True
+    if not user_scopes:
+        user_cfg = {
+            "oauth2_install_params": {"scopes": ["applications.commands"], "permissions": "0"}
+        }
+    updated = _discord_app_request(
+        "PATCH",
+        raw,
+        {
+            "install_params": {
+                "scopes": ["bot", "applications.commands"],
+                "permissions": perms,
+            },
+            "integration_types_config": {
+                "0": {
+                    "oauth2_install_params": {
+                        "scopes": ["bot", "applications.commands"],
+                        "permissions": perms,
+                    }
+                },
+                "1": user_cfg,
+            },
+        },
+    )
+    if not updated:
+        return False
+    log.info("discord Add to Server now includes the bot user")
+    return True
+
+
 class DiscordBot(GuildScopedOps):
     def __init__(self, settings, on_prompt, speaker=None, on_call_speech=None, transcribe=None) -> None:
         self.settings = settings
@@ -88,6 +265,25 @@ class DiscordBot(GuildScopedOps):
         self._call_session_until: dict[int, float] = {}
         self._music = MusicManager()
         self._call_followup: dict[int, float] = {}
+        self._chip_watch_started = False
+
+    def invite_url(self) -> str:
+        user = getattr(self._client, "user", None) if self._client else None
+        return discord_invite_url(
+            token=self.settings.get("discord_bot_token") or "",
+            client_id=getattr(user, "id", None),
+        )
+
+    def invite_reply(self) -> str:
+        url = self.invite_url()
+        if not url:
+            return "Enable Discord in the Opus panel first, then ask me for the invite link."
+        return (
+            "Open this link and use Add to Server so I can join that server's voice. "
+            "For group DMs, also add me as a user app (Add App) so /opus, /join, and /play work there. "
+            "Discord still won't let bots sit in a group-DM call — join a server voice channel and I'll hop in from the group chat.\n"
+            f"{url}"
+        )
 
     @staticmethod
     def _member_names(member: discord.Member) -> dict[str, str]:
@@ -166,10 +362,10 @@ class DiscordBot(GuildScopedOps):
         if message.author.bot:
             return False, ""
         guild_allow = self._as_set(self.settings.get("discord_allowed_guilds"))
-        if guild_allow and (not message.guild or str(message.guild.id) not in guild_allow):
+        if message.guild and guild_allow and str(message.guild.id) not in guild_allow:
             return False, ""
         channel_allow = self._as_set(self.settings.get("discord_allowed_channels"))
-        if channel_allow and str(message.channel.id) not in channel_allow:
+        if message.guild and channel_allow and str(message.channel.id) not in channel_allow:
             return False, ""
         text = (message.content or "").strip()
         if not text:
@@ -241,20 +437,84 @@ class DiscordBot(GuildScopedOps):
                 return True
         return False
 
+    def _is_voice_question(self, text: str) -> bool:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return False
+        from opus.intents import strip_wake
+
+        stripped = strip_wake(cleaned) or cleaned
+        if stripped.endswith("?") or cleaned.endswith("?"):
+            return True
+        if CALL_QUESTION_RE.search(stripped) or CALL_QUESTION_RE.search(cleaned):
+            return True
+        if ORIGIN_QUESTION_RE.search(cleaned) and not NOT_ORIGIN_RE.search(cleaned):
+            return True
+        return False
+
+    async def _speak_if_question(self, prompt: str, answer: str, message: discord.Message) -> None:
+        if not answer:
+            return
+        if not self._is_voice_question(prompt):
+            return
+        guild = message.guild or self._guild_for(member=message.author)
+        if not guild:
+            return
+        voice = self._voice_for_guild(guild.id)
+        in_chat = self._is_connected_channel(message.channel)
+        in_their_call = False
+        if voice and voice.channel:
+            in_their_call = any(
+                getattr(item, "id", 0) == getattr(message.author, "id", 0)
+                for item in voice.channel.members
+            )
+        if not in_chat and not in_their_call:
+            return
+        await self._speak_in_call(answer, guild.id)
+
     def _is_talking_to_opus(self, text: str) -> bool:
         cleaned = (text or "").strip()
         if not cleaned or CALL_CHAT_NOISE_RE.match(cleaned):
             return False
         from opus.intents import contains_wake, match_intents, strip_wake
         from opus.discord_fun import fun_reply
-        from opus.discord_guild import MUSIC_SKIP_RE, MUSIC_STOP_RE, PLAY_MUSIC_RE
+        from opus.discord_guild import (
+            MUSIC_PAUSE_RE,
+            MUSIC_REPEAT_RE,
+            MUSIC_REPLAY_RE,
+            MUSIC_SKIP_RE,
+            MUSIC_STOP_RE,
+            PLAY_MUSIC_RE,
+        )
 
         if contains_wake(cleaned) or CALL_GREETING_RE.search(cleaned):
             return True
         if cleaned.endswith("?") or CALL_QUESTION_RE.search(cleaned):
             return True
         stripped = strip_wake(cleaned)
-        if fun_reply(stripped) or PLAY_MUSIC_RE.match(stripped) or MUSIC_SKIP_RE.match(stripped) or MUSIC_STOP_RE.match(stripped):
+        if (
+            fun_reply(stripped)
+            or PLAY_MUSIC_RE.match(stripped)
+            or MUSIC_SKIP_RE.match(stripped)
+            or MUSIC_REPLAY_RE.match(stripped)
+            or MUSIC_PAUSE_RE.match(stripped)
+            or MUSIC_STOP_RE.match(stripped)
+            or MUSIC_REPEAT_RE.match(stripped)
+        ):
+            return True
+        from opus.discord_lyrics import LYRICS_RE
+        from opus.discord_polls import POLL_COMMAND_RE
+        from opus.discord_roles import REACTIONROLE_COMMAND_RE
+        from opus.discord_guild import TTS_TOGGLE_RE
+        from opus.discord_chips import CHIPS_COMMAND_RE
+
+        if (
+            LYRICS_RE.match(stripped)
+            or POLL_COMMAND_RE.match(stripped)
+            or REACTIONROLE_COMMAND_RE.match(stripped)
+            or TTS_TOGGLE_RE.match(stripped)
+            or CHIPS_COMMAND_RE.match(stripped)
+        ):
             return True
         intents = match_intents(cleaned if contains_wake(cleaned) else f"opus {cleaned}")
         return any(
@@ -263,6 +523,7 @@ class DiscordBot(GuildScopedOps):
                 "discord_join_call",
                 "discord_bot_leave",
                 "discord_leave_call",
+                "discord_invite",
                 "coinflip",
                 "dice",
                 "discord_play_music",
@@ -273,6 +534,8 @@ class DiscordBot(GuildScopedOps):
         )
 
     async def _index_message(self, message: discord.Message, *, force: bool = False) -> None:
+        if getattr(message, "_interaction", None) is not None:
+            return
         if not force and not self._should_index(message):
             return
         if message.author.bot or not message.guild:
@@ -368,6 +631,156 @@ class DiscordBot(GuildScopedOps):
         if stats["skipped"]:
             lines.append("Skipped (no access): " + ", ".join(f"#{name}" for name in stats["skipped"][:8]))
         return "\n".join(lines)
+
+    def _can_manage_roles(self, member) -> bool:
+        if self._member_is_admin(member):
+            return True
+        perms = getattr(member, "guild_permissions", None)
+        return bool(perms and perms.manage_roles)
+
+    async def _handle_poll_command(self, message: discord.Message, prompt: str) -> None:
+        from opus.discord_polls import parse_poll
+
+        parsed = parse_poll(prompt)
+        if isinstance(parsed, str):
+            await message.reply(parsed)
+            return
+        if not getattr(message, "channel", None):
+            await message.reply("I couldn't see this chat to post a poll.")
+            return
+        question, options, duration, multiple = parsed
+        poll = discord.Poll(question=question, duration=duration, multiple=multiple)
+        for option in options:
+            poll.add_answer(text=option)
+        try:
+            sent = await message.channel.send(poll=poll)
+        except discord.Forbidden:
+            await message.reply("I need Send Polls permission in this channel.")
+            return
+        except Exception as exc:
+            log.exception("poll send failed")
+            await message.reply(f"Couldn't start that poll: {exc}")
+            return
+        if message.guild and not multiple:
+            from opus.discord_chips import start_poll_bets
+
+            try:
+                await start_poll_bets(self, message, sent, question, options, duration)
+            except Exception:
+                log.exception("poll bet setup failed")
+
+    async def _handle_reactionrole_command(self, message: discord.Message, prompt: str) -> None:
+        from opus.discord_roles import USAGE, action_name, emoji_key_from_token, parse_role_pairs
+
+        if not message.guild:
+            await message.reply("Reaction roles only work in servers.")
+            return
+        if not self._can_manage_roles(message.author):
+            await message.reply("You need Manage Roles to set those up.")
+            return
+        action = action_name(prompt)
+        if action == "help":
+            await message.reply(USAGE)
+            return
+        if action == "list":
+            rows = self.store.list_reaction_roles(str(message.guild.id))
+            if not rows:
+                await message.reply("No reaction roles in this server yet.")
+                return
+            lines: list[str] = []
+            for row in rows[:20]:
+                lines.append(f"<#{row['channel_id']}> {row['emoji']} <@&{row['role_id']}>")
+            extra = f"\n…and {len(rows) - 20} more." if len(rows) > 20 else ""
+            await message.reply("\n".join(lines) + extra)
+            return
+        if action == "remove":
+            target_id = 0
+            if message.reference and message.reference.message_id:
+                target_id = int(message.reference.message_id)
+            else:
+                match = re.search(r"\b(\d{15,25})\b", prompt)
+                if match:
+                    target_id = int(match.group(1))
+            if not target_id:
+                await message.reply("Reply to the roles message, or include its message ID.")
+                return
+            removed = self.store.delete_reaction_message(str(message.guild.id), str(target_id))
+            await message.reply("Removed those reaction roles." if removed else "I didn't have roles on that message.")
+            return
+        pairs = parse_role_pairs(message)
+        if not pairs:
+            await message.reply(USAGE)
+            return
+        target = None
+        if message.reference and message.reference.message_id:
+            try:
+                target = await message.channel.fetch_message(int(message.reference.message_id))
+            except Exception:
+                target = None
+        if target is None:
+            embed = discord.Embed(title="Reaction roles", color=0xC4A574)
+            embed.description = "\n".join(f"{emoji} — {role.mention}" for emoji, role in pairs)
+            try:
+                target = await message.channel.send(embed=embed)
+            except Exception as exc:
+                await message.reply(f"Couldn't post the roles message: {exc}")
+                return
+        added = 0
+        for emoji, role in pairs:
+            try:
+                await target.add_reaction(emoji)
+            except Exception:
+                log.exception("reactionrole emoji failed emoji=%s", emoji)
+                continue
+            self.store.save_reaction_role(
+                guild_id=str(message.guild.id),
+                channel_id=str(target.channel.id),
+                message_id=str(target.id),
+                emoji_key=emoji_key_from_token(str(emoji)),
+                emoji=str(emoji),
+                role_id=str(role.id),
+            )
+            added += 1
+        if not added:
+            await message.reply("I couldn't add those emoji reactions.")
+            return
+        await message.reply(f"Reaction roles are live on that message ({added}).")
+
+    async def _apply_reaction_role(self, payload: discord.RawReactionActionEvent, *, add: bool) -> None:
+        from opus.discord_roles import emoji_key
+
+        if not payload.guild_id or not self._client or not self._client.user:
+            return
+        if payload.user_id == self._client.user.id:
+            return
+        role_id = self.store.lookup_reaction_role(
+            str(payload.guild_id),
+            str(payload.message_id),
+            emoji_key(payload.emoji),
+        )
+        if not role_id:
+            return
+        guild = self._client.get_guild(int(payload.guild_id))
+        if guild is None:
+            return
+        role = guild.get_role(int(role_id))
+        member = guild.get_member(int(payload.user_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(payload.user_id))
+            except Exception:
+                return
+        if role is None or member is None or member.bot:
+            return
+        try:
+            if add:
+                await member.add_roles(role, reason="Opus reaction role")
+            else:
+                await member.remove_roles(role, reason="Opus reaction role")
+        except discord.Forbidden:
+            log.warning("reaction role forbidden guild=%s role=%s", payload.guild_id, role_id)
+        except Exception:
+            log.exception("reaction role update failed")
 
     async def _handle_scan_command(self, message: discord.Message, prompt: str) -> None:
         if not message.guild:
@@ -495,6 +908,41 @@ class DiscordBot(GuildScopedOps):
         intents.voice_states = True
         client = discord.Client(intents=intents)
         self._client = client
+        tree = app_commands.CommandTree(client)
+
+        def _slash(name, description):
+            return tree.command(name=name, description=description)
+
+        async def _run_slash(interaction: discord.Interaction, content: str) -> None:
+            await interaction.response.defer()
+            try:
+                await on_message(InteractionMessage(interaction, content))
+            except Exception:
+                log.exception("slash command failed")
+                try:
+                    await interaction.followup.send("I hit an error running that.")
+                except Exception:
+                    pass
+
+        @_slash("opus", "Ask Opus or run a command (play, join, poll, …)")
+        @app_commands.describe(command="What to say, like play never gonna give you up")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+        async def opus_slash(interaction: discord.Interaction, command: str):
+            await _run_slash(interaction, f"opus {command}")
+
+        @_slash("join", "Join your current server voice call")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+        async def join_slash(interaction: discord.Interaction):
+            await _run_slash(interaction, "opus join")
+
+        @_slash("play", "Play a song in the call you're in")
+        @app_commands.describe(query="Song name or YouTube link")
+        @app_commands.allowed_installs(guilds=True, users=True)
+        @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+        async def play_slash(interaction: discord.Interaction, query: str):
+            await _run_slash(interaction, f"opus play {query}")
 
         @client.event
         async def on_ready():
@@ -505,7 +953,50 @@ class DiscordBot(GuildScopedOps):
                     log.exception("guild chunk failed guild=%s", guild.id)
                 self._refresh_guild_roster(guild)
                 asyncio.create_task(self._backfill_guild(guild))
+                try:
+                    self.store.grant_opus_allowance(str(guild.id))
+                except Exception:
+                    log.exception("opus allowance failed guild=%s", guild.id)
+            try:
+                synced = await tree.sync()
+                log.info("discord slash commands synced count=%s", len(synced))
+            except Exception:
+                log.exception("discord command sync failed")
             log.info("discord connected as %s", client.user)
+            if not getattr(self, "_chip_watch_started", False):
+                self._chip_watch_started = True
+                from opus.discord_chips import watch_chip_polls
+
+                asyncio.create_task(watch_chip_polls(self))
+            if not getattr(self, "_chip_restored", False):
+                self._chip_restored = True
+                try:
+                    holds = self.store.restore_open_holds()
+                    challenges = self.store.abandon_live_challenges()
+                    if holds or challenges:
+                        log.info("restored chip state holds=%s challenges=%s", holds, challenges)
+                except Exception:
+                    log.exception("chip restore failed")
+
+        @client.event
+        async def on_guild_join(guild: discord.Guild):
+            log.info("joined discord server %s (%s)", guild.name, guild.id)
+            try:
+                await guild.chunk()
+            except Exception:
+                log.exception("guild chunk failed guild=%s", guild.id)
+            self._refresh_guild_roster(guild)
+            asyncio.create_task(self._backfill_guild(guild))
+            try:
+                self.store.grant_opus_allowance(str(guild.id))
+            except Exception:
+                log.exception("opus allowance failed guild=%s", guild.id)
+
+        @client.event
+        async def on_guild_remove(guild: discord.Guild):
+            log.info("left discord server %s (%s)", guild.name, guild.id)
+            self._member_rosters.pop(int(guild.id), None)
+            self._drop_guild_voice_state(int(guild.id))
 
         @client.event
         async def on_voice_state_update(member, before, after):
@@ -535,7 +1026,25 @@ class DiscordBot(GuildScopedOps):
                 self._refresh_guild_roster(after.guild)
 
         @client.event
+        async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+            await self._apply_reaction_role(payload, add=True)
+
+        @client.event
+        async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+            await self._apply_reaction_role(payload, add=False)
+
+        @client.event
         async def on_message(message: discord.Message):
+            try:
+                await _handle_on_message(message)
+            except Exception:
+                log.exception("discord on_message failed")
+                try:
+                    await message.reply("I hit an error on that one.")
+                except Exception:
+                    pass
+
+        async def _handle_on_message(message: discord.Message):
             await self._index_message(message)
             ok, prompt = self._should_respond(message)
             if not ok:
@@ -546,26 +1055,72 @@ class DiscordBot(GuildScopedOps):
             if SCAN_COMMAND_RE.match(prompt.strip()):
                 await self._handle_scan_command(message, prompt)
                 return
+            from opus.discord_polls import POLL_COMMAND_RE
+            from opus.discord_roles import REACTIONROLE_COMMAND_RE
+
+            if POLL_COMMAND_RE.match(prompt.strip()):
+                await self._handle_poll_command(message, prompt)
+                return
+            from opus.discord_chips import handle_chip_command
+
+            try:
+                if await handle_chip_command(self, message, prompt):
+                    return
+            except Exception:
+                log.exception("chip command failed")
+                try:
+                    await message.reply("I hit an error on that chip command.")
+                except Exception:
+                    pass
+                return
+            if REACTIONROLE_COMMAND_RE.match(prompt.strip()):
+                await self._handle_reactionrole_command(message, prompt)
+                return
+            if INVITE_RE.match(prompt.strip()):
+                await message.reply(self.invite_reply())
+                return
             if JOIN_CALL_RE.match(prompt.strip()):
                 result = await self._join_for_member(
-                    message.author if message.guild else None,
+                    message.author,
                     message.guild,
                 )
                 await message.reply(result)
                 return
             if LEAVE_CALL_RE.match(prompt.strip()):
-                result = await self._leave_voice(message.guild)
+                result = await self._leave_voice(message.guild or self._guild_for(member=message.author))
+                await message.reply(result)
+                return
+            from opus.intents import contains_wake, match_intents
+
+            call_intents = match_intents(
+                prompt if contains_wake(prompt) else f"opus {prompt}"
+            )
+            if any(item.name == "discord_invite" for item in call_intents):
+                await message.reply(self.invite_reply())
+                return
+            join_or_leave = [
+                item
+                for item in call_intents
+                if item.name in {"discord_join_call", "discord_bot_leave", "discord_leave_call"}
+            ]
+            if join_or_leave:
+                last = join_or_leave[-1]
+                if last.name in {"discord_bot_leave", "discord_leave_call"}:
+                    await message.reply(await self._leave_voice(message.guild or self._guild_for(member=message.author)))
+                    return
+                result = await self._join_for_member(
+                    message.author,
+                    message.guild,
+                )
                 await message.reply(result)
                 return
             extra = await self._handle_fun_or_music(
                 prompt,
                 message.guild,
-                message.author if message.guild else None,
+                message.author,
             )
             if extra:
                 await message.reply(extra)
-                if message.guild and self._is_connected_channel(message.channel):
-                    await self._speak_in_call(extra, message.guild.id)
                 return
             prompt = re.sub(
                 r"\b(mute|unmute|deafen|undeafen|kick|timeout|untimeout)\s*alls?\b",
@@ -618,8 +1173,6 @@ class DiscordBot(GuildScopedOps):
                         elif item.name == "discord_leave_call":
                             replies.append("Leave call is a local Discord keybind — use voice Opus for that.")
                     await message.reply(" ".join(replies)[:1800])
-                    if self._is_connected_channel(message.channel) and message.guild:
-                        await self._speak_in_call(" ".join(replies), message.guild.id)
                     return
                 action = self._normalize_mod_action(mod.group(1) or mod.group(2) or "")
                 target = (mod.group(3) or "all").strip()
@@ -630,19 +1183,13 @@ class DiscordBot(GuildScopedOps):
                     actor=message.author,
                 )
                 await message.reply(result)
-                if self._is_connected_channel(message.channel) and message.guild:
-                    await self._speak_in_call(result, message.guild.id)
                 return
             asks_creation = bool(ORIGIN_QUESTION_RE.search(prompt)) and not NOT_ORIGIN_RE.search(prompt)
             if asks_creation:
                 aegritudo = self._mention_by_name(message, "Aegritudo", "@Aegritudo")
                 reply = f"{aegritudo} built me from scratch and made me what I am."
                 await message.reply(reply)
-                if self._is_connected_channel(message.channel) and message.guild:
-                    await self._speak_in_call(
-                        "Aegritudo built me from scratch and made me what I am.",
-                        message.guild.id,
-                    )
+                await self._speak_if_question(prompt, "Aegritudo built me from scratch and made me what I am.", message)
                 return
 
 
@@ -683,9 +1230,9 @@ class DiscordBot(GuildScopedOps):
                 self._refresh_guild_roster(message.guild) if message.guild else ""
             )
 
-            async with message.channel.typing():
+            async def _answer_prompt():
                 try:
-                    answer = await asyncio.to_thread(
+                    return await asyncio.to_thread(
                         self.on_prompt,
                         full_prompt,
                         str(message.author.display_name),
@@ -696,12 +1243,18 @@ class DiscordBot(GuildScopedOps):
                     )
                 except Exception:
                     log.exception("discord prompt failed")
-                    answer = "I hit an error while answering."
+                    return "I hit an error while answering."
+
+            if getattr(message.channel, "typing", None):
+                async with message.channel.typing():
+                    answer = await _answer_prompt()
+            else:
+                answer = await _answer_prompt()
             await message.reply(answer[:1800] if answer else "Done.")
-            if self._is_connected_channel(message.channel) and message.guild:
-                await self._speak_in_call(answer or "Done.", message.guild.id)
+            await self._speak_if_question(prompt, answer or "Done.", message)
 
         token = (self.settings.get("discord_bot_token") or "").strip()
+        await asyncio.to_thread(ensure_discord_guild_install, token)
         await client.start(token)
 
     def start(self) -> None:
@@ -723,6 +1276,12 @@ class DiscordBot(GuildScopedOps):
         self._thread.start()
 
     def stop(self) -> None:
+        try:
+            self.store.restore_open_holds()
+            self.store.abandon_live_challenges()
+            self.store.checkpoint()
+        except Exception:
+            log.exception("chip restore on stop failed")
         if not self._loop or not self._client:
             return
         try:
